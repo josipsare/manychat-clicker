@@ -39,15 +39,16 @@ try {
             if ($debugData.criticalFiles) {
                 Write-Host "`n  Critical Files:" -ForegroundColor Cyan
                 foreach ($file in $debugData.criticalFiles.PSObject.Properties) {
-                    $status = if ($file.Value.exists) { "✓" } else { "✗" }
+                    $status = if ($file.Value.exists) { "[OK]" } else { "[MISS]" }
                     $color = if ($file.Value.exists) { "Green" } else { "Red" }
-                    $size = if ($file.Value.exists -and $file.Value.size) { " ($([math]::Round($file.Value.size/1KB, 2)) KB)" } else { "" }
-                    Write-Host "    $status $($file.Name)$size" -ForegroundColor $color
+                    $sizeKB = if ($file.Value.exists -and $file.Value.size) { [math]::Round($file.Value.size/1KB, 2) } else { 0 }
+                    $sizeStr = if ($sizeKB -gt 0) { " ($sizeKB KB)" } else { "" }
+                    Write-Host "    $status $($file.Name)$sizeStr" -ForegroundColor $color
                 }
             }
         }
         
-        Write-Host "`n✅ Verification complete!" -ForegroundColor Green
+        Write-Host "`n[SUCCESS] Verification complete!" -ForegroundColor Green
         Write-Host "`nNext step: Test with /press endpoint or /debug-verify-login" -ForegroundColor Yellow
         
     } catch {

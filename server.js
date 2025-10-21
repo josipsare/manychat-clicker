@@ -97,8 +97,8 @@ async function isLoggedIn(page) {
       return false;
     }
     
-    if (currentUrl.includes('/login') || currentUrl.includes('/auth')) {
-      console.log('Still on login/auth page');
+    if (currentUrl.includes('/login') || currentUrl.includes('/auth') || currentUrl.includes('/signin')) {
+      console.log('Still on login/auth/signin page');
       return false;
     }
     
@@ -213,7 +213,7 @@ async function manualLoginFlow(page) {
       
       // Check if we're still on login page
       const currentUrl = page.url();
-      if (currentUrl.includes('/login') || currentUrl.includes('/auth')) {
+      if (currentUrl.includes('/login') || currentUrl.includes('/auth') || currentUrl.includes('/signin')) {
         console.log('Still on login page, waiting...');
       } else {
         console.log('Moved away from login page, checking if logged in...');
@@ -566,7 +566,7 @@ app.post('/debug-verify-login', async (req, res) => {
       
       // Run detailed checks
       debugResult.checks.onManyChatDomain = debugResult.url.includes('app.manychat.com');
-      debugResult.checks.notOnLoginPage = !debugResult.url.includes('/login') && !debugResult.url.includes('/auth');
+      debugResult.checks.notOnLoginPage = !debugResult.url.includes('/login') && !debugResult.url.includes('/auth') && !debugResult.url.includes('/signin');
       
       // Check for dashboard elements
       const selectorChecks = {
@@ -655,18 +655,24 @@ app.get('/debug-session', async (req, res) => {
         
         if (debugInfo.defaultFolder.exists) {
           // Check critical session files
-          const criticalFiles = ['Cookies', 'Local Storage', 'Preferences', 'Network'];
-          criticalFiles.forEach(file => {
-            const filePath = path.join(defaultPath, file);
+          const criticalFiles = {
+            'Cookies': path.join(defaultPath, 'Network', 'Cookies'),
+            'Local Storage': path.join(defaultPath, 'Local Storage'),
+            'Preferences': path.join(defaultPath, 'Preferences'),
+            'Sessions': path.join(defaultPath, 'Sessions'),
+            'Network Persistent State': path.join(defaultPath, 'Network', 'Network Persistent State')
+          };
+          
+          Object.entries(criticalFiles).forEach(([name, filePath]) => {
             if (fs.existsSync(filePath)) {
               const stats = fs.statSync(filePath);
-              debugInfo.criticalFiles[file] = {
+              debugInfo.criticalFiles[name] = {
                 exists: true,
                 size: stats.size,
                 isDirectory: stats.isDirectory()
               };
             } else {
-              debugInfo.criticalFiles[file] = { exists: false };
+              debugInfo.criticalFiles[name] = { exists: false };
             }
           });
         }
