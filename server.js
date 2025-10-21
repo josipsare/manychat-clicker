@@ -469,46 +469,117 @@ app.get('/switch-headless', (_req, res) => {
   res.json({ ok: true, message: 'Switched to headless mode. Restart server to apply changes.' });
 });
 
-// Cloud login endpoint (for platforms without display)
-app.get('/cloud-login', async (_req, res) => {
-  console.log('Cloud login requested');
+// Session transfer endpoint (for cloud deployment)
+app.post('/transfer-session', async (req, res) => {
+  console.log('Session transfer requested');
   
   try {
+    const { cookies, localStorage, sessionStorage } = req.body;
+    
+    if (!cookies || !localStorage) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'Missing required session data (cookies, localStorage)' 
+      });
+    }
+    
     const ctx = await ensureContext();
     const page = await ctx.newPage();
-
-    // Navigate to ManyChat login page
-    await page.goto('https://manychat.com/login', { waitUntil: 'domcontentloaded' });
+    
+    // Navigate to ManyChat
+    await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
+    
+    // Set cookies
+    if (cookies && Array.isArray(cookies)) {
+      await page.context().addCookies(cookies);
+    }
+    
+    // Set localStorage
+    if (localStorage && typeof localStorage === 'object') {
+      await page.evaluate((data) => {
+        for (const [key, value] of Object.entries(data)) {
+          localStorage.setItem(key, value);
+        }
+      }, localStorage);
+    }
+    
+    // Set sessionStorage
+    if (sessionStorage && typeof sessionStorage === 'object') {
+      await page.evaluate((data) => {
+        for (const [key, value] of Object.entries(data)) {
+          sessionStorage.setItem(key, value);
+        }
+      }, sessionStorage);
+    }
+    
+    // Refresh page to apply session data
+    await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle');
+    await page.waitForTimeout(2000);
     
-    console.log('==========================================');
-    console.log('CLOUD LOGIN INSTRUCTIONS:');
-    console.log('1. This is a cloud environment - no browser window will open');
-    console.log('2. You need to complete login manually on your local machine');
-    console.log('3. After logging in locally, the session will be shared');
-    console.log('4. Or use the /manual-login endpoint with session data');
-    console.log('==========================================');
-    
-    // Wait a bit for any automatic redirects
-    await page.waitForTimeout(5000);
-    
-    // Check if we got redirected to dashboard
-    const currentUrl = page.url();
-    console.log(`Current URL after login attempt: ${currentUrl}`);
-    
+    // Check if login worked
     if (await isLoggedIn(page)) {
       await page.close();
-      console.log('Login successful!');
-      return res.json({ ok: true, message: 'Login completed successfully!' });
+      console.log('Session transfer successful!');
+      return res.json({ ok: true, message: 'Session transferred successfully!' });
     } else {
       await page.close();
       return res.status(400).json({ 
         ok: false, 
-        error: 'Cloud login not supported. Use /manual-login with session data or complete login locally first.' 
+        error: 'Session transfer failed - login not detected' 
       });
     }
   } catch (e) {
-    console.error('Error in cloud-login:', e);
+    console.error('Error in session transfer:', e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+// Get session data endpoint (for local extraction)
+app.get('/get-session', async (_req, res) => {
+  console.log('Session data requested');
+  
+  try {
+    const ctx = await ensureContext();
+    const page = await ctx.newPage();
+    
+    await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
+    
+    // Get cookies
+    const cookies = await page.context().cookies();
+    
+    // Get localStorage
+    const localStorage = await page.evaluate(() => {
+      const data = {};
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const key = window.localStorage.key(i);
+        data[key] = window.localStorage.getItem(key);
+      }
+      return data;
+    });
+    
+    // Get sessionStorage
+    const sessionStorage = await page.evaluate(() => {
+      const data = {};
+      for (let i = 0; i < window.sessionStorage.length; i++) {
+        const key = window.sessionStorage.key(i);
+        data[key] = window.sessionStorage.getItem(key);
+      }
+      return data;
+    });
+    
+    await page.close();
+    
+    res.json({
+      ok: true,
+      sessionData: {
+        cookies,
+        localStorage,
+        sessionStorage
+      }
+    });
+  } catch (e) {
+    console.error('Error getting session data:', e);
     res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
