@@ -535,6 +535,56 @@ app.post('/transfer-session', async (req, res) => {
   }
 });
 
+// Upload user-data endpoint (for deployment)
+app.post('/upload-user-data', async (req, res) => {
+  console.log('User data upload requested');
+  
+  try {
+    // This endpoint receives base64 encoded zip file
+    const { fileData, fileName } = req.body;
+    
+    if (!fileData) {
+      return res.status(400).json({ ok: false, error: 'No file data provided' });
+    }
+    
+    const fs = await import('fs');
+    const path = await import('path');
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(exec);
+    
+    // Save the uploaded file
+    const tempPath = '/tmp/user-data-upload.zip';
+    const buffer = Buffer.from(fileData, 'base64');
+    fs.writeFileSync(tempPath, buffer);
+    
+    console.log(`User data file saved: ${tempPath} (${buffer.length} bytes)`);
+    
+    // Extract to USER_DATA_DIR
+    const extractPath = USER_DATA_DIR.replace('/Default', '');
+    
+    // Create directory if it doesn't exist
+    await execAsync(`mkdir -p ${extractPath}`);
+    
+    // Extract zip file
+    await execAsync(`unzip -o ${tempPath} -d ${extractPath}`);
+    
+    console.log(`User data extracted to: ${extractPath}`);
+    
+    // Clean up temp file
+    fs.unlinkSync(tempPath);
+    
+    res.json({ 
+      ok: true, 
+      message: 'User data uploaded and extracted successfully',
+      extractedTo: extractPath
+    });
+  } catch (e) {
+    console.error('Error uploading user data:', e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
 // Get session data endpoint (for local extraction)
 app.get('/get-session', async (_req, res) => {
   console.log('Session data requested');

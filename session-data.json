@@ -1,0 +1,27 @@
+﻿
+
+StatusCode        : 200
+StatusDescription : OK
+Content           : {"ok":true,"sessionData":{"cookies":[{"name":"aws-waf-toke
+                    n","value":"b26ae269-a7fb-45ce-bb61-7f1a55e807a0:CQoAZLp/L
+                    ++nAwAA:bZHIeXkFYabs+gbvuIkJquf3N/GDUHCGwABFvj6sPcLLOLSCHV
+                    tcVmH659ZxCcuZAyo8VNFWIhUk...
+RawContent        : HTTP/1.1 200 OK
+                    Connection: keep-alive
+                    Keep-Alive: timeout=5
+                    Content-Length: 9798
+                    Content-Type: application/json; charset=utf-8
+                    Date: Tue, 21 Oct 2025 18:16:43 GMT
+                    ETag: W/"2646-tYHf0yBrOBAYpgGh...
+Forms             : {}
+Headers           : {[Connection, keep-alive], [Keep-Alive, timeout=5], 
+                    [Content-Length, 9798], [Content-Type, application/json; 
+                    charset=utf-8]...}
+Images            : {}
+InputFields       : {}
+Links             : {}
+ParsedHtml        : mshtml.HTMLDocumentClass
+RawContentLength  : 9798
+
+
+
