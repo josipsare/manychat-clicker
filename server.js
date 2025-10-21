@@ -9,11 +9,13 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const {
   AUTH_TOKEN,
-  USER_DATA_DIR = process.env.NODE_ENV === 'production' ? '/tmp/user-data' : './data/user-data',
   MC_PAGE_ID = 'fb2860983',
   PORT = process.env.PORT || 3000,
   HEADLESS = 'true'
 } = process.env;
+
+// Fix: Respect USER_DATA_DIR from environment, don't override it
+const USER_DATA_DIR = process.env.USER_DATA_DIR || (process.env.NODE_ENV === 'production' ? '/data/user-data' : './data/user-data');
 
 const BASE = 'https://app.manychat.com';
 const queue = new PQueue({ concurrency: 1, timeout: 180_000 });
@@ -536,6 +538,149 @@ app.post('/transfer-session', async (req, res) => {
   }
 });
 
+// Debug endpoint: Verify login detection with detailed results
+app.post('/debug-verify-login', async (req, res) => {
+  try {
+    console.log('Debug verify login requested');
+    
+    await ensureContext();
+    const page = await context.newPage();
+    
+    const debugResult = {
+      timestamp: new Date().toISOString(),
+      userDataDir: USER_DATA_DIR,
+      url: null,
+      checks: {},
+      isLoggedIn: false,
+      screenshot: null
+    };
+    
+    try {
+      // Navigate to ManyChat
+      console.log('Navigating to ManyChat...');
+      await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(3000); // Wait for redirects
+      
+      debugResult.url = page.url();
+      console.log(`Current URL: ${debugResult.url}`);
+      
+      // Run detailed checks
+      debugResult.checks.onManyChatDomain = debugResult.url.includes('app.manychat.com');
+      debugResult.checks.notOnLoginPage = !debugResult.url.includes('/login') && !debugResult.url.includes('/auth');
+      
+      // Check for dashboard elements
+      const selectorChecks = {
+        'h1:has-text("Hello,")': false,
+        'text="connected channel"': false,
+        'text="Home"': false,
+        'div[class*="sidebar"]': false,
+        'a[href*="/dashboard"]': false,
+        '[data-testid*="dashboard"]': false
+      };
+      
+      for (const selector of Object.keys(selectorChecks)) {
+        try {
+          const element = await page.locator(selector).first();
+          const count = await element.count();
+          selectorChecks[selector] = count > 0;
+          if (count > 0) {
+            console.log(`✓ Found: ${selector}`);
+          }
+        } catch (e) {
+          // Selector not found
+        }
+      }
+      
+      debugResult.checks.selectors = selectorChecks;
+      debugResult.checks.anyDashboardElement = Object.values(selectorChecks).some(v => v);
+      
+      // Overall login status
+      debugResult.isLoggedIn = 
+        debugResult.checks.onManyChatDomain && 
+        debugResult.checks.notOnLoginPage && 
+        debugResult.checks.anyDashboardElement;
+      
+      // Take screenshot
+      const screenshotBuffer = await page.screenshot({ fullPage: false });
+      debugResult.screenshot = screenshotBuffer.toString('base64');
+      
+      console.log(`Login check result: ${debugResult.isLoggedIn ? 'LOGGED IN' : 'NOT LOGGED IN'}`);
+      
+    } finally {
+      await page.close();
+    }
+    
+    res.json(debugResult);
+  } catch (e) {
+    console.error('Error in debug verify login:', e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+// Debug endpoint: Check session data on filesystem
+app.get('/debug-session', async (req, res) => {
+  try {
+    const fs = await import('fs');
+    const path = await import('path');
+    
+    const debugInfo = {
+      userDataDir: USER_DATA_DIR,
+      exists: fs.existsSync(USER_DATA_DIR),
+      files: [],
+      defaultFolder: {
+        exists: false,
+        path: path.join(USER_DATA_DIR, 'Default')
+      },
+      criticalFiles: {},
+      browserContext: {
+        initialized: !!context,
+        status: context ? 'active' : 'not created'
+      },
+      environment: {
+        NODE_ENV: process.env.NODE_ENV,
+        RAILWAY_ENVIRONMENT: process.env.RAILWAY_ENVIRONMENT,
+        HEADLESS: HEADLESS
+      }
+    };
+    
+    if (debugInfo.exists) {
+      try {
+        const items = fs.readdirSync(USER_DATA_DIR);
+        debugInfo.files = items.slice(0, 20); // First 20 items
+        debugInfo.totalItems = items.length;
+        
+        // Check Default folder
+        const defaultPath = path.join(USER_DATA_DIR, 'Default');
+        debugInfo.defaultFolder.exists = fs.existsSync(defaultPath);
+        
+        if (debugInfo.defaultFolder.exists) {
+          // Check critical session files
+          const criticalFiles = ['Cookies', 'Local Storage', 'Preferences', 'Network'];
+          criticalFiles.forEach(file => {
+            const filePath = path.join(defaultPath, file);
+            if (fs.existsSync(filePath)) {
+              const stats = fs.statSync(filePath);
+              debugInfo.criticalFiles[file] = {
+                exists: true,
+                size: stats.size,
+                isDirectory: stats.isDirectory()
+              };
+            } else {
+              debugInfo.criticalFiles[file] = { exists: false };
+            }
+          });
+        }
+      } catch (e) {
+        debugInfo.error = e.message;
+      }
+    }
+    
+    res.json(debugInfo);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
 // Upload user-data endpoint (for deployment)
 app.post('/upload-user-data', async (req, res) => {
   console.log('User data upload requested');
@@ -559,26 +704,46 @@ app.post('/upload-user-data', async (req, res) => {
     
     console.log(`User data file saved: ${tempPath} (${buffer.length} bytes)`);
     
-    // Extract to the parent directory of USER_DATA_DIR
-    // If USER_DATA_DIR is /data/user-data, extract to /data so it becomes /data/user-data/...
-    const extractPath = path.dirname(USER_DATA_DIR);
+    // Smart extraction: Check if zip contains 'user-data/' folder
+    const zip = new AdmZip(tempPath);
+    const entries = zip.getEntries();
+    
+    // Check if zip has 'user-data/' as root folder
+    const hasUserDataFolder = entries.some(entry => entry.entryName.startsWith('user-data/'));
+    
+    let extractPath;
+    if (hasUserDataFolder) {
+      // Zip contains 'user-data/' folder, extract to parent (/data)
+      // This creates: /data/user-data/...
+      extractPath = path.dirname(USER_DATA_DIR);
+      console.log(`Zip contains 'user-data/' folder, extracting to: ${extractPath}`);
+    } else {
+      // Zip contains files directly, extract to USER_DATA_DIR
+      extractPath = USER_DATA_DIR;
+      console.log(`Zip contains files directly, extracting to: ${extractPath}`);
+    }
     
     // Create directory if it doesn't exist
     if (!fs.existsSync(extractPath)) {
       fs.mkdirSync(extractPath, { recursive: true });
     }
     
-    // Extract zip file using adm-zip
-    console.log(`Extracting zip to: ${extractPath}`);
-    console.log(`This will create: ${USER_DATA_DIR}`);
-    const zip = new AdmZip(tempPath);
+    // Extract zip file
+    console.log(`Extracting ${entries.length} entries...`);
     zip.extractAllTo(extractPath, true);
     
     // Verify extraction
     if (fs.existsSync(USER_DATA_DIR)) {
-      console.log(`✅ Verified: ${USER_DATA_DIR} exists`);
+      const files = fs.readdirSync(USER_DATA_DIR);
+      console.log(`✅ Verified: ${USER_DATA_DIR} exists with ${files.length} items`);
+      console.log(`First few items: ${files.slice(0, 5).join(', ')}`);
     } else {
       console.log(`⚠️ Warning: ${USER_DATA_DIR} not found after extraction`);
+      // List what was actually created
+      if (fs.existsSync(extractPath)) {
+        const items = fs.readdirSync(extractPath);
+        console.log(`Found in ${extractPath}: ${items.join(', ')}`);
+      }
     }
     
     console.log(`User data extracted to: ${extractPath}`);
@@ -586,10 +751,24 @@ app.post('/upload-user-data', async (req, res) => {
     // Clean up temp file
     fs.unlinkSync(tempPath);
     
+    // Close existing browser context to force reload of new session data
+    if (context) {
+      try {
+        console.log('Closing existing browser context to reload session data...');
+        await context.close();
+        context = null;
+        console.log('Browser context closed successfully');
+      } catch (e) {
+        console.log('Error closing context (may already be closed):', e.message);
+        context = null;
+      }
+    }
+    
     res.json({ 
       ok: true, 
-      message: 'User data uploaded and extracted successfully',
-      extractedTo: extractPath
+      message: 'User data uploaded and extracted successfully. Browser context will reload on next request.',
+      extractedTo: extractPath,
+      userDataDir: USER_DATA_DIR
     });
   } catch (e) {
     console.error('Error uploading user data:', e);
