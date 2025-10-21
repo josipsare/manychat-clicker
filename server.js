@@ -22,10 +22,30 @@ let context;
 async function ensureContext() {
   if (!context) {
     console.log('Creating new browser context...');
+    
+    // Determine if we're in a cloud environment (no display)
+    const isCloudEnvironment = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER;
+    
+    // Browser args for cloud environments
+    const browserArgs = [
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--disable-web-security',
+      '--disable-features=VizDisplayCompositor'
+    ];
+    
+    // Add virtual display args for cloud environments
+    if (isCloudEnvironment && HEADLESS === 'false') {
+      browserArgs.push('--virtual-time-budget=5000');
+      console.log('Cloud environment detected - using virtual display mode');
+    }
+    
     context = await chromium.launchPersistentContext(USER_DATA_DIR, {
       headless: HEADLESS === 'true',
       viewport: { width: 1440, height: 900 },
-      args: ['--disable-dev-shm-usage', '--no-sandbox']
+      args: browserArgs
     });
     console.log('Browser context created successfully');
   } else {
@@ -35,10 +55,25 @@ async function ensureContext() {
       console.log('Reusing existing browser context');
     } catch (error) {
       console.log('Context is invalid, creating new one...');
+      
+      const isCloudEnvironment = process.env.NODE_ENV === 'production' || process.env.RAILWAY_ENVIRONMENT || process.env.RENDER;
+      const browserArgs = [
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor'
+      ];
+      
+      if (isCloudEnvironment && HEADLESS === 'false') {
+        browserArgs.push('--virtual-time-budget=5000');
+      }
+      
       context = await chromium.launchPersistentContext(USER_DATA_DIR, {
         headless: HEADLESS === 'true',
         viewport: { width: 1440, height: 900 },
-        args: ['--disable-dev-shm-usage', '--no-sandbox']
+        args: browserArgs
       });
       console.log('New browser context created successfully');
     }
@@ -434,6 +469,50 @@ app.get('/switch-headless', (_req, res) => {
   res.json({ ok: true, message: 'Switched to headless mode. Restart server to apply changes.' });
 });
 
+// Cloud login endpoint (for platforms without display)
+app.get('/cloud-login', async (_req, res) => {
+  console.log('Cloud login requested');
+  
+  try {
+    const ctx = await ensureContext();
+    const page = await ctx.newPage();
+
+    // Navigate to ManyChat login page
+    await page.goto('https://manychat.com/login', { waitUntil: 'domcontentloaded' });
+    await page.waitForLoadState('networkidle');
+    
+    console.log('==========================================');
+    console.log('CLOUD LOGIN INSTRUCTIONS:');
+    console.log('1. This is a cloud environment - no browser window will open');
+    console.log('2. You need to complete login manually on your local machine');
+    console.log('3. After logging in locally, the session will be shared');
+    console.log('4. Or use the /manual-login endpoint with session data');
+    console.log('==========================================');
+    
+    // Wait a bit for any automatic redirects
+    await page.waitForTimeout(5000);
+    
+    // Check if we got redirected to dashboard
+    const currentUrl = page.url();
+    console.log(`Current URL after login attempt: ${currentUrl}`);
+    
+    if (await isLoggedIn(page)) {
+      await page.close();
+      console.log('Login successful!');
+      return res.json({ ok: true, message: 'Login completed successfully!' });
+    } else {
+      await page.close();
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'Cloud login not supported. Use /manual-login with session data or complete login locally first.' 
+      });
+    }
+  } catch (e) {
+    console.error('Error in cloud-login:', e);
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
 // Manual login confirmation endpoint
 app.get('/confirm-login', async (_req, res) => {
   console.log('Manual login confirmation requested');
@@ -538,13 +617,8 @@ app.post('/press', async (req, res) => {
   }
 });
 
-// Check login status on startup (only in headless mode)
+// Check login status on startup
 async function checkInitialLoginStatus() {
-  if (HEADLESS === 'false') {
-    console.log('Non-headless mode: Skipping initial login check');
-    return;
-  }
-  
   try {
     console.log('Checking initial login status...');
     const ctx = await ensureContext();
