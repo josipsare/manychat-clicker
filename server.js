@@ -559,8 +559,9 @@ app.post('/upload-user-data', async (req, res) => {
     
     console.log(`User data file saved: ${tempPath} (${buffer.length} bytes)`);
     
-    // Extract to USER_DATA_DIR parent
-    const extractPath = USER_DATA_DIR.includes('Default') ? USER_DATA_DIR.replace('/Default', '') : path.dirname(USER_DATA_DIR);
+    // Extract to the parent directory of USER_DATA_DIR
+    // If USER_DATA_DIR is /data/user-data, extract to /data so it becomes /data/user-data/...
+    const extractPath = path.dirname(USER_DATA_DIR);
     
     // Create directory if it doesn't exist
     if (!fs.existsSync(extractPath)) {
@@ -568,9 +569,17 @@ app.post('/upload-user-data', async (req, res) => {
     }
     
     // Extract zip file using adm-zip
-    console.log(`Extracting to: ${extractPath}`);
+    console.log(`Extracting zip to: ${extractPath}`);
+    console.log(`This will create: ${USER_DATA_DIR}`);
     const zip = new AdmZip(tempPath);
     zip.extractAllTo(extractPath, true);
+    
+    // Verify extraction
+    if (fs.existsSync(USER_DATA_DIR)) {
+      console.log(`✅ Verified: ${USER_DATA_DIR} exists`);
+    } else {
+      console.log(`⚠️ Warning: ${USER_DATA_DIR} not found after extraction`);
+    }
     
     console.log(`User data extracted to: ${extractPath}`);
     
