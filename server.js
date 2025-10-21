@@ -4,7 +4,8 @@ import PQueue from 'p-queue';
 import { chromium } from 'playwright';
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '50mb' })); // Increased for user-data upload
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const {
   AUTH_TOKEN,
