@@ -550,9 +550,7 @@ app.post('/upload-user-data', async (req, res) => {
     
     const fs = await import('fs');
     const path = await import('path');
-    const { exec } = await import('child_process');
-    const { promisify } = await import('util');
-    const execAsync = promisify(exec);
+    const AdmZip = (await import('adm-zip')).default;
     
     // Save the uploaded file
     const tempPath = '/tmp/user-data-upload.zip';
@@ -561,14 +559,18 @@ app.post('/upload-user-data', async (req, res) => {
     
     console.log(`User data file saved: ${tempPath} (${buffer.length} bytes)`);
     
-    // Extract to USER_DATA_DIR
-    const extractPath = USER_DATA_DIR.replace('/Default', '');
+    // Extract to USER_DATA_DIR parent
+    const extractPath = USER_DATA_DIR.includes('Default') ? USER_DATA_DIR.replace('/Default', '') : path.dirname(USER_DATA_DIR);
     
     // Create directory if it doesn't exist
-    await execAsync(`mkdir -p ${extractPath}`);
+    if (!fs.existsSync(extractPath)) {
+      fs.mkdirSync(extractPath, { recursive: true });
+    }
     
-    // Extract zip file
-    await execAsync(`unzip -o ${tempPath} -d ${extractPath}`);
+    // Extract zip file using adm-zip
+    console.log(`Extracting to: ${extractPath}`);
+    const zip = new AdmZip(tempPath);
+    zip.extractAllTo(extractPath, true);
     
     console.log(`User data extracted to: ${extractPath}`);
     
