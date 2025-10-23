@@ -7,3 +7,8 @@ data/
 *.log
 .DS_Store
 Thumbs.db
+manychat-extension/
+cloudflared.exe
+ngrok.exe
+tunnel-url.txt
+*.zip

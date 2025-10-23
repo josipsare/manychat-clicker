@@ -9,7 +9,6 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const {
   AUTH_TOKEN,
-  MC_PAGE_ID = 'fb2860983',
   PORT = process.env.PORT || 3000,
   HEADLESS = 'true'
 } = process.env;
@@ -230,9 +229,9 @@ async function manualLoginFlow(page) {
   }
 }
 
-async function openChat(page, chatId) {
-  console.log(`Opening chat: ${chatId}`);
-  const url = `${BASE}/${MC_PAGE_ID}/chat/${chatId}`;
+async function openChat(page, chatId, pageId) {
+  console.log(`Opening chat: ${chatId} on page: ${pageId}`);
+  const url = `${BASE}/${pageId}/chat/${chatId}`;
   console.log(`Navigating to: ${url}`);
   
   try {
@@ -378,11 +377,126 @@ async function clickSendToInstagram(page) {
   throw new Error('Could not find "Send to Instagram" button. Check screenshot for debugging.');
 }
 
-async function handlePress({ chatId, message }) {
-  console.log(`Starting handlePress for chatId: ${chatId}, message: ${message}`);
+async function clickAutomationTimerButton(page) {
+  console.log('Looking for automation timer button (with orange pause icon)...');
   
-  if (!chatId || !message) {
-    throw new Error('Both "chatId" and "message" are required.');
+  // Multiple selectors for the countdown timer button at the top
+  const buttonSelectors = [
+    // Data attribute selector from the code you provided
+    page.locator('button[data-onboarding-id="pause-automation-section"]'),
+    
+    // Button containing time format (00:16:10, etc.)
+    page.locator('button:has-text("00:")'),
+    page.locator('button').filter({ hasText: /\d{2}:\d{2}:\d{2}/ }),
+    
+    // Button with Automations header nearby
+    page.locator('button').filter({ hasText: /^\d{2}:\d{2}/ }),
+    
+    // Class-based selectors for the timer button
+    page.locator('button[class*="btnV2"]').filter({ hasText: /\d{2}:/ }),
+    
+    // Generic button near "Automations" text
+    page.locator('text=Automations').locator('..').locator('button').first()
+  ];
+
+  for (let i = 0; i < buttonSelectors.length; i++) {
+    const selector = buttonSelectors[i];
+    try {
+      const count = await selector.count();
+      console.log(`Trying automation timer button selector ${i + 1}/${buttonSelectors.length}, found ${count} elements`);
+      
+      if (count > 0) {
+        const button = selector.first();
+        const isVisible = await button.isVisible().catch(() => false);
+        const isEnabled = await button.isEnabled().catch(() => false);
+        
+        if (isVisible && isEnabled) {
+          const buttonText = await button.textContent().catch(() => 'unknown');
+          console.log(`✅ Found automation timer button: "${buttonText}" with selector ${i + 1}`);
+          await button.click({ delay: 50 });
+          console.log('✅ Automation timer button clicked successfully');
+          return true;
+        }
+      }
+    } catch (e) {
+      console.log(`Automation timer button selector ${i + 1} failed:`, e.message);
+      continue;
+    }
+  }
+  
+  console.log('⚠️  Automation timer button not found (this may be normal if not visible)');
+  return false;
+}
+
+async function clickResumeAutomationsButton(page) {
+  console.log('Looking for "Resume automations" button in dropdown...');
+  
+  // Wait a bit more for the dropdown menu to be fully rendered
+  await page.waitForTimeout(500);
+  
+  // Multiple strategies to find "Resume automations" in the dropdown
+  // Based on HTML: <ul class="menu m-0"><li class="flex"><span class="d-flex"><svg...>Resume automations</span></li></ul>
+  const buttonSelectors = [
+    // Most specific: First li in ul.menu that contains "Resume automations" text
+    page.locator('ul.menu li:first-child:has-text("Resume automations")'),
+    page.locator('ul.menu li.flex:first-child:has-text("Resume automations")'),
+    page.locator('ul[class*="menu"] li:first-child:has-text("Resume automations")'),
+    
+    // Click the span inside the first li
+    page.locator('ul.menu li:first-child span:has-text("Resume automations")'),
+    page.locator('ul.menu li.flex:first-child span.d-flex:has-text("Resume automations")'),
+    
+    // Generic first item in menu with Resume text
+    page.locator('ul.menu li:first-child').filter({ hasText: /Resume automations/i }),
+    page.locator('ul[class*="menu"] li:first-child').filter({ hasText: /Resume automations/i }),
+    
+    // Exact match for "Resume automations" text in menu
+    page.getByRole('button', { name: 'Resume automations' }),
+    page.getByRole('button', { name: /resume automations/i }),
+    
+    // Text-based selectors
+    page.locator('li:has-text("Resume automations")').first(),
+    page.locator('span:has-text("Resume automations")').first(),
+    
+    // Menu item selectors
+    page.locator('[role="menu"] li:first-child:has-text("Resume")'),
+    page.locator('[role="menuitem"]:has-text("Resume automations")').first()
+  ];
+
+  for (let i = 0; i < buttonSelectors.length; i++) {
+    const selector = buttonSelectors[i];
+    try {
+      const count = await selector.count();
+      console.log(`Trying "Resume automations" dropdown button selector ${i + 1}/${buttonSelectors.length}, found ${count} elements`);
+      
+      if (count > 0) {
+        const button = selector.first();
+        const isVisible = await button.isVisible().catch(() => false);
+        const isEnabled = await button.isEnabled().catch(() => false);
+        
+        if (isVisible && isEnabled) {
+          const buttonText = await button.textContent().catch(() => 'unknown');
+          console.log(`✅ Found "Resume automations" button in dropdown: "${buttonText}" with selector ${i + 1}`);
+          await button.click({ delay: 50 });
+          console.log('✅ "Resume automations" button clicked successfully');
+          return true;
+        }
+      }
+    } catch (e) {
+      console.log(`"Resume automations" button selector ${i + 1} failed:`, e.message);
+      continue;
+    }
+  }
+  
+  console.log('⚠️  "Resume automations" button not found in dropdown (this may be normal if dropdown did not appear)');
+  return false;
+}
+
+async function handlePress({ chatId, message, pageId }) {
+  console.log(`Starting handlePress for chatId: ${chatId}, message: ${message}, pageId: ${pageId}`);
+  
+  if (!chatId || !message || !pageId) {
+    throw new Error('All fields required: "chatId", "message", and "pageId".');
   }
 
   const ctx = await ensureContext();
@@ -397,12 +511,25 @@ async function handlePress({ chatId, message }) {
     await page.waitForTimeout(2000); // Wait for page to fully load
     
     if (!(await isLoggedIn(page))) {
-      throw new Error('Not logged in. Run /init-login with HEADLESS=false first.');
+      if (HEADLESS === 'false') {
+        // In non-headless mode, wait for user to complete manual login
+        console.log('⏳ Not logged in - waiting for manual login in browser...');
+        console.log('👉 Please complete the ManyChat login in the browser window');
+        console.log('⏱️  Waiting up to 5 minutes for you to login...');
+        
+        const loginSuccess = await manualLoginFlow(page);
+        if (!loginSuccess) {
+          throw new Error('Login timeout - please complete login and try again');
+        }
+        console.log('✅ Login completed!');
+      } else {
+        throw new Error('Not logged in. Run /init-login with HEADLESS=false first.');
+      }
     }
     console.log('Login check passed');
 
     console.log('Opening chat...');
-    const composer = await openChat(page, chatId);
+    const composer = await openChat(page, chatId, pageId);
     console.log('Chat opened successfully');
 
     // Optional: clear any prefilled text
@@ -423,9 +550,36 @@ async function handlePress({ chatId, message }) {
     await clickSendToInstagram(page);
     console.log('Send button clicked successfully');
 
-    await page.waitForTimeout(1200); // small settle
+    await page.waitForTimeout(2000); // Wait for message to fully send
     console.log('Message sent successfully');
-    return { ok: true, chatId, message: 'Message sent successfully' };
+    
+    // NEW: Step 1 - Click the automation timer button (with orange pause icon)
+    console.log('\n=== Starting automation button sequence ===');
+    console.log('Step 1: Looking for automation timer button...');
+    await page.waitForTimeout(2000); // Wait before looking for timer button
+    
+    const timerButtonClicked = await clickAutomationTimerButton(page);
+    if (timerButtonClicked) {
+      console.log('✅ Step 1 complete: Timer button clicked');
+      console.log('⏳ Waiting 3 seconds for dropdown menu to appear...');
+      await page.waitForTimeout(3000); // Longer wait for dropdown to appear
+      
+      // NEW: Step 2 - Click "Resume automations" in the dropdown
+      console.log('Step 2: Looking for "Resume automations" in dropdown...');
+      const resumeButtonClicked = await clickResumeAutomationsButton(page);
+      if (resumeButtonClicked) {
+        console.log('✅ Step 2 complete: "Resume automations" clicked');
+        console.log('⏳ Waiting 2 seconds for automation to resume...');
+        await page.waitForTimeout(2000); // Wait for automation to resume
+        console.log('=== Automation button sequence complete ===\n');
+      } else {
+        console.log('⚠️  Step 2 failed: "Resume automations" button not found in dropdown');
+      }
+    } else {
+      console.log('⚠️  Step 1 failed: Timer button not found (skipping Step 2)');
+    }
+    
+    return { ok: true, chatId, message: 'Message sent and automation sequence completed' };
   } catch (error) {
     console.error('Error in handlePress:', error);
     
@@ -917,16 +1071,16 @@ app.post('/press', async (req, res) => {
       return res.status(401).json({ error: 'unauthorized' });
     }
     
-    const { chatId, message } = req.body || {};
-    console.log(`Request body: chatId=${chatId}, message=${message}`);
+    const { chatId, message, pageId } = req.body || {};
+    console.log(`Request body: chatId=${chatId}, message=${message}, pageId=${pageId}`);
     
-    if (!chatId || !message) {
+    if (!chatId || !message || !pageId) {
       console.log('Missing required parameters');
-      return res.status(400).json({ error: 'Both chatId and message are required' });
+      return res.status(400).json({ error: 'All fields required: chatId, message, and pageId' });
     }
     
     console.log('Adding task to queue...');
-    const result = await queue.add(() => handlePress({ chatId, message }));
+    const result = await queue.add(() => handlePress({ chatId, message, pageId }));
     console.log('Task completed successfully:', result);
     res.json(result);
   } catch (err) {
@@ -961,5 +1115,10 @@ async function checkInitialLoginStatus() {
 
 app.listen(PORT, async () => {
   console.log(`manychat-clicker listening on :${PORT} (headless=${HEADLESS})`);
-  await checkInitialLoginStatus();
+  // Skip initial login check in non-headless mode to keep browser open
+  if (HEADLESS === 'true') {
+    await checkInitialLoginStatus();
+  } else {
+    console.log('⏳ Browser will open on first API request - login will be required');
+  }
 });
