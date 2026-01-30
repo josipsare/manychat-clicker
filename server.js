@@ -688,7 +688,7 @@ async function searchAndSelectAutomation(page, automationName) {
         const count = await selector.count();
         if (count > 0) {
           const input = selector.first();
-          const isVisible = await input.isVisible({ timeout: 500 }).catch(() => false);
+          const isVisible = await input.isVisible({ timeout: 5000 }).catch(() => false);
           if (isVisible) {
             searchInput = input;
             console.log(`Found search input with selector ${i + 1}`);
@@ -703,17 +703,17 @@ async function searchAndSelectAutomation(page, automationName) {
     if (!searchInput) {
       if (attempt < MAX_RETRIES) {
         console.log('Could not find search input, retrying...');
-        await page.waitForTimeout(300 * attempt);
+        await page.waitForTimeout(500 * attempt);
         continue;
       }
       throw new Error('Could not find search input in automation picker modal');
     }
     
-    // Click on search input to ensure focus
+    // IMPROVEMENT #3: Explicitly click on search input to ensure focus
     try {
       console.log('Clicking on search input to ensure focus...');
       await searchInput.click();
-      await page.waitForTimeout(50);
+      await page.waitForTimeout(150);
     } catch (e) {
       console.log('Could not click search input:', e.message);
     }
@@ -723,7 +723,7 @@ async function searchAndSelectAutomation(page, automationName) {
       console.log('Clearing search field...');
       await page.keyboard.press('ControlOrMeta+a');
       await page.keyboard.press('Backspace');
-      await page.waitForTimeout(50);
+      await page.waitForTimeout(150);
     } catch (e) {
       console.log('Could not clear search input:', e.message);
     }
@@ -739,9 +739,9 @@ async function searchAndSelectAutomation(page, automationName) {
     
     console.log('Automation name typed');
     
-    // Wait for search results to appear
+    // IMPROVEMENT #4: Increased wait time for search results to appear
     console.log('Waiting for search results to load...');
-    await page.waitForTimeout(800); // Balanced: enough time for results but not too slow
+    await page.waitForTimeout(1200); // Increased from 600ms to 1200ms
     
     // Find and click the automation card/row matching the exact name
     console.log('Looking for automation in search results...');
