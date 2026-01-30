@@ -709,13 +709,13 @@ async function searchAndSelectAutomation(page, automationName) {
       throw new Error('Could not find search input in automation picker modal');
     }
     
-    // IMPROVEMENT #3: Explicitly click on search input to ensure focus
+    // Click on search input to ensure focus (short timeout - if it fails, continue anyway)
     try {
       console.log('Clicking on search input to ensure focus...');
-      await searchInput.click();
-      await page.waitForTimeout(150);
+      await searchInput.click({ timeout: 2000 });
+      await page.waitForTimeout(100);
     } catch (e) {
-      console.log('Could not click search input:', e.message);
+      console.log('Click on search input timed out, continuing anyway...');
     }
     
     // Clear any existing text
