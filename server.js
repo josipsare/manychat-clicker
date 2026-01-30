@@ -666,119 +666,168 @@ async function clickAutomationButton(page) {
 async function searchAndSelectAutomation(page, automationName) {
   console.log(`Searching for automation: "${automationName}"...`);
   
-  // Wait for search input field in the automation picker modal
-  const searchInputSelectors = [
-    page.locator('input[placeholder*="Search"]'),
-    page.locator('input[placeholder*="search"]'),
-    page.locator('input[placeholder*="Search all"]'),
-    page.locator('input[type="text"]').filter({ has: page.locator('..') }),
-    page.locator('input[class*="search"]'),
-    page.locator('input').filter({ hasText: /search/i })
-  ];
+  const MAX_RETRIES = 3;
   
-  let searchInput = null;
-  for (let i = 0; i < searchInputSelectors.length; i++) {
-    const selector = searchInputSelectors[i];
-    try {
-      const count = await selector.count();
-      if (count > 0) {
-        const input = selector.first();
-        const isVisible = await input.isVisible({ timeout: 5000 }).catch(() => false);
-        if (isVisible) {
-          searchInput = input;
-          console.log(`Found search input with selector ${i + 1}`);
-          break;
-        }
-      }
-    } catch (e) {
-      continue;
-    }
-  }
-  
-  if (!searchInput) {
-    throw new Error('Could not find search input in automation picker modal');
-  }
-  
-  // Clear any existing text (field is already focused, so just use keyboard shortcuts)
-  try {
-    console.log('Clearing search field...');
-    await page.keyboard.press('ControlOrMeta+a');
-    await page.keyboard.press('Backspace');
-    await page.waitForTimeout(150); // Aggressive: reduced from 300ms
-  } catch (e) {
-    console.log('Could not clear search input:', e.message);
-  }
-  
-  // Type automation name - aggressive: type faster
-  console.log(`Typing automation name: "${automationName}"...`);
-  
-  // Aggressive: faster typing for search field
-  for (const char of automationName) {
-    const jitter = (Math.random() - 0.5) * 2 * 20; // Aggressive: less variance
-    const delay = Math.max(10, Math.round(40 + jitter)); // Aggressive: 40ms base instead of 60ms
-    await page.keyboard.type(char, { delay });
-  }
-  
-  console.log('Automation name typed');
-  
-  // Wait for search results to appear
-  await page.waitForTimeout(600); // Aggressive: reduced from 1500ms
-  
-  // Find and click the automation card/row matching the exact name
-  console.log('Looking for automation in search results...');
-  const automationSelectors = [
-    // Exact text match in automation card
-    page.locator(`text="${automationName}"`).first(),
-    page.locator(`article:has-text("${automationName}")`),
-    page.locator(`div:has-text("${automationName}")`).filter({ hasText: automationName }),
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    console.log(`Attempt ${attempt}/${MAX_RETRIES} to find automation "${automationName}"...`);
     
-    // Automation card with matching name
-    page.locator('article').filter({ hasText: new RegExp(`^${automationName}$`) }),
-    page.locator('[class*="card"]').filter({ hasText: automationName }),
+    // Wait for search input field in the automation picker modal
+    const searchInputSelectors = [
+      page.locator('input[placeholder*="Search"]'),
+      page.locator('input[placeholder*="search"]'),
+      page.locator('input[placeholder*="Search all"]'),
+      page.locator('input[type="text"]').filter({ has: page.locator('..') }),
+      page.locator('input[class*="search"]'),
+      page.locator('input').filter({ hasText: /search/i })
+    ];
     
-    // Table row with matching name
-    page.locator('tr').filter({ hasText: automationName }),
-    page.locator('div[class*="listView"]').locator(`text="${automationName}"`).first()
-  ];
-  
-  let automationFound = false;
-  for (let i = 0; i < automationSelectors.length; i++) {
-    const selector = automationSelectors[i];
-    try {
-      const count = await selector.count();
-      console.log(`Trying automation selector ${i + 1}/${automationSelectors.length}, found ${count} elements`);
-      
-      if (count > 0) {
-        const element = selector.first();
-        const isVisible = await element.isVisible({ timeout: 3000 }).catch(() => false);
-        
-        if (isVisible) {
-          // Verify it contains the exact automation name
-          const text = await element.textContent().catch(() => '');
-          if (text.includes(automationName)) {
-            console.log(`Found automation "${automationName}" with selector ${i + 1}`);
-            await element.click({ delay: 50 });
-            automationFound = true;
+    let searchInput = null;
+    for (let i = 0; i < searchInputSelectors.length; i++) {
+      const selector = searchInputSelectors[i];
+      try {
+        const count = await selector.count();
+        if (count > 0) {
+          const input = selector.first();
+          const isVisible = await input.isVisible({ timeout: 5000 }).catch(() => false);
+          if (isVisible) {
+            searchInput = input;
+            console.log(`Found search input with selector ${i + 1}`);
             break;
           }
         }
+      } catch (e) {
+        continue;
       }
+    }
+    
+    if (!searchInput) {
+      if (attempt < MAX_RETRIES) {
+        console.log('Could not find search input, retrying...');
+        await page.waitForTimeout(500 * attempt);
+        continue;
+      }
+      throw new Error('Could not find search input in automation picker modal');
+    }
+    
+    // IMPROVEMENT #3: Explicitly click on search input to ensure focus
+    try {
+      console.log('Clicking on search input to ensure focus...');
+      await searchInput.click();
+      await page.waitForTimeout(150);
     } catch (e) {
-      console.log(`Automation selector ${i + 1} failed:`, e.message);
-      continue;
+      console.log('Could not click search input:', e.message);
+    }
+    
+    // Clear any existing text
+    try {
+      console.log('Clearing search field...');
+      await page.keyboard.press('ControlOrMeta+a');
+      await page.keyboard.press('Backspace');
+      await page.waitForTimeout(150);
+    } catch (e) {
+      console.log('Could not clear search input:', e.message);
+    }
+    
+    // Type automation name
+    console.log(`Typing automation name: "${automationName}"...`);
+    
+    for (const char of automationName) {
+      const jitter = (Math.random() - 0.5) * 2 * 20;
+      const delay = Math.max(10, Math.round(40 + jitter));
+      await page.keyboard.type(char, { delay });
+    }
+    
+    console.log('Automation name typed');
+    
+    // IMPROVEMENT #4: Increased wait time for search results to appear
+    console.log('Waiting for search results to load...');
+    await page.waitForTimeout(1200); // Increased from 600ms to 1200ms
+    
+    // Find and click the automation card/row matching the exact name
+    console.log('Looking for automation in search results...');
+    
+    // IMPROVED: Target clickable elements (buttons) first, then fall back to text elements
+    const automationSelectors = [
+      // Priority 1: Click the card's main action button that contains the automation name
+      page.locator('[class*="card"]').filter({ hasText: automationName }).locator('button').first(),
+      page.locator('[class*="card"]').filter({ hasText: automationName }).first(),
+      
+      // Priority 2: Article-based cards
+      page.locator('article').filter({ hasText: automationName }).locator('button').first(),
+      page.locator('article').filter({ hasText: automationName }).first(),
+      
+      // Priority 3: Direct text match (will use force:true if needed)
+      page.locator(`text="${automationName}"`).first(),
+      page.locator(`div:has-text("${automationName}")`).filter({ hasText: automationName }),
+      
+      // Priority 4: Table row with matching name
+      page.locator('tr').filter({ hasText: automationName }),
+      page.locator('div[class*="listView"]').locator(`text="${automationName}"`).first()
+    ];
+    
+    let automationFound = false;
+    for (let i = 0; i < automationSelectors.length; i++) {
+      const selector = automationSelectors[i];
+      try {
+        const count = await selector.count();
+        console.log(`Trying automation selector ${i + 1}/${automationSelectors.length}, found ${count} elements`);
+        
+        if (count > 0) {
+          const element = selector.first();
+          const isVisible = await element.isVisible({ timeout: 3000 }).catch(() => false);
+          
+          if (isVisible) {
+            // Verify the card/container contains the automation name
+            const text = await element.textContent().catch(() => '');
+            // For buttons inside cards, also check parent text
+            const parentText = await element.locator('..').textContent().catch(() => text);
+            
+            if (text.includes(automationName) || parentText.includes(automationName)) {
+              console.log(`Found automation "${automationName}" with selector ${i + 1}`);
+              
+              // Try normal click first, fall back to force:true if intercepted
+              try {
+                await element.click({ delay: 50, timeout: 3000 });
+              } catch (clickError) {
+                if (clickError.message && clickError.message.includes('intercepts pointer events')) {
+                  console.log('Click intercepted, using force:true...');
+                  await element.click({ delay: 50, force: true });
+                } else {
+                  throw clickError;
+                }
+              }
+              
+              automationFound = true;
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        console.log(`Automation selector ${i + 1} failed:`, e.message);
+        continue;
+      }
+    }
+    
+    if (automationFound) {
+      console.log(`Automation "${automationName}" selected successfully on attempt ${attempt}`);
+      await page.waitForTimeout(400);
+      return true;
+    }
+    
+    // IMPROVEMENT #7: Retry logic with exponential backoff
+    if (attempt < MAX_RETRIES) {
+      const waitTime = 500 * attempt; // 500ms, 1000ms for subsequent retries
+      console.log(`Automation not found on attempt ${attempt}, waiting ${waitTime}ms before retry...`);
+      await page.screenshot({ path: `./data/automation-not-found-attempt-${attempt}.png`, fullPage: true });
+      console.log(`Screenshot saved to ./data/automation-not-found-attempt-${attempt}.png`);
+      await page.waitForTimeout(waitTime);
     }
   }
   
-  if (!automationFound) {
-    // Take a screenshot for debugging
-    await page.screenshot({ path: './data/automation-not-found-error.png', fullPage: true });
-    console.log('Screenshot saved to ./data/automation-not-found-error.png');
-    throw new Error(`Automation "${automationName}" not found in search results. Check screenshot for debugging.`);
-  }
-  
-  console.log(`Automation "${automationName}" selected successfully`);
-  await page.waitForTimeout(400); // Aggressive: reduced from 1000ms
-  return true;
+  // All retries exhausted
+  await page.screenshot({ path: './data/automation-not-found-error.png', fullPage: true });
+  console.log('Screenshot saved to ./data/automation-not-found-error.png');
+  throw new Error(`Automation "${automationName}" not found in search results after ${MAX_RETRIES} attempts. Check screenshots for debugging.`);
 }
 
 async function clickPickThisAutomationButton(page) {
