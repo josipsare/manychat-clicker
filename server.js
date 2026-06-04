@@ -2,6 +2,104 @@ import 'dotenv/config';
 import express from 'express';
 import PQueue from 'p-queue';
 import { chromium } from 'playwright';
+import crypto from 'crypto';
+
+// ---------- Global crash guards + alert ----------
+// Prevent unhandled errors from killing the entire Node.js process. The whole server
+// stays alive; only the individual job fails. When the guard catches something, send
+// an alert through the existing FOLLOWUP_LOG_WEBHOOK_URL with `event: 'crash'` so the
+// n8n workflow there can route crashes to Discord/Slack/etc.
+const SERVER_NAME = process.env.SERVER_NAME || 'manychat-clicker';
+const CRASH_NOTIFICATION_RATE_LIMIT_MS = Number(process.env.CRASH_NOTIFICATION_RATE_LIMIT_MS ?? 60_000);
+let lastCrashNotificationAt = 0;
+let suppressedCrashCount = 0;
+
+function sendCrashNotification(kind, err, opts = {}) {
+  const now = Date.now();
+  if (!opts.force && now - lastCrashNotificationAt < CRASH_NOTIFICATION_RATE_LIMIT_MS) {
+    suppressedCrashCount++;
+    return;
+  }
+  // Build a single human-readable string with everything the operator needs in Slack.
+  const errMsg = err?.message ?? String(err);
+  const stack = err?.stack ? String(err.stack).split('\n').slice(0, 20).join('\n') : '';
+  const suppressNote = suppressedCrashCount > 0
+    ? `\n(${suppressedCrashCount} additional crashes suppressed since last alert)`
+    : '';
+  const message = `[CRASH on ${SERVER_NAME}] ${kind}\n${errMsg}${stack ? `\n\nStack:\n${stack}` : ''}${suppressNote}`;
+
+  const payload = {
+    event: 'crash', // n8n filters on this to route alerts differently from follow-up logs
+    server: SERVER_NAME,
+    message
+  };
+  lastCrashNotificationAt = now;
+  suppressedCrashCount = 0;
+  // Reuse the existing follow-up log poster. Function declaration (hoisted), reads
+  // FOLLOWUP_LOG_WEBHOOK_URL at call time, fire-and-forget.
+  try {
+    sendFollowupLog(payload);
+  } catch (e) {
+    console.error('[crash-notify] sendFollowupLog threw (ignored):', e.message);
+  }
+}
+
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ UNCAUGHT EXCEPTION (process kept alive):', err.message);
+  console.error(err.stack);
+  try { sendCrashNotification('uncaughtException', err); } catch (_) { /* swallow */ }
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ UNHANDLED REJECTION (process kept alive):', reason instanceof Error ? reason.message : reason);
+  if (reason instanceof Error) console.error(reason.stack);
+  try { sendCrashNotification('unhandledRejection', reason instanceof Error ? reason : new Error(String(reason))); } catch (_) { /* swallow */ }
+});
+
+// ---------- Dedup-blocked alert ----------
+// Send a Slack-bound message every time the dedup layer blocks a duplicate retry,
+// so the operator can monitor that the feature is working. Rate-limited to avoid
+// spam during retry bursts; suppressed counts roll into the next alert.
+const DEDUP_NOTIFICATION_RATE_LIMIT_MS = Number(process.env.DEDUP_NOTIFICATION_RATE_LIMIT_MS ?? 5 * 60 * 1000); // 5 min
+let lastDedupNotificationAt = 0;
+let suppressedDedupCount = 0;
+
+function sendDedupNotification(params, opts = {}) {
+  const { type, chatId, pageId, message, automation_name, dedupKind, ageMs } = params || {};
+  const now = Date.now();
+  if (!opts.force && now - lastDedupNotificationAt < DEDUP_NOTIFICATION_RATE_LIMIT_MS) {
+    suppressedDedupCount++;
+    return;
+  }
+  const lines = [`[DEDUP on ${SERVER_NAME}] Blocked duplicate send`];
+  lines.push(`type: ${type ?? '?'} | chatId: ${chatId ?? '?'} | pageId: ${pageId ?? '?'}`);
+  if (type === 'automation' && automation_name) {
+    lines.push(`Automation: ${automation_name}`);
+  } else if (type === 'text' && message) {
+    const preview = message.length > 80 ? message.slice(0, 80) + '…' : message;
+    lines.push(`Message: ${preview}`);
+  }
+  if (dedupKind === 'cached') {
+    const ageStr = ageMs != null ? `${Math.round(ageMs / 1000)}s` : 'recently';
+    lines.push(`Reason: cached (original sent ${ageStr} ago)`);
+  } else if (dedupKind === 'in-flight') {
+    lines.push(`Reason: in-flight (original is still running)`);
+  }
+  if (suppressedDedupCount > 0) {
+    lines.push(`(${suppressedDedupCount} additional duplicates suppressed since last alert)`);
+  }
+  const finalMessage = lines.join('\n');
+  lastDedupNotificationAt = now;
+  suppressedDedupCount = 0;
+  try {
+    sendFollowupLog({
+      event: 'dedup-blocked',
+      server: SERVER_NAME,
+      message: finalMessage
+    });
+  } catch (e) {
+    console.error('[dedup-notify] sendFollowupLog threw (ignored):', e.message);
+  }
+}
 
 const app = express();
 app.use(express.json({ limit: '50mb' })); // Increased for user-data upload
@@ -9,27 +107,94 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const {
   AUTH_TOKEN,
-  PORT = process.env.PORT || 3000,
-  HEADLESS = 'true'
+  PORT = process.env.PORT || 3000
 } = process.env;
+// HEADLESS is `let` because /switch-headless reassigns it at runtime.
+let HEADLESS = process.env.HEADLESS ?? 'true';
 
 // Fix: Respect USER_DATA_DIR from environment, don't override it
 const USER_DATA_DIR = process.env.USER_DATA_DIR || (process.env.NODE_ENV === 'production' ? '/data/user-data' : './data/user-data');
 
 const BASE = 'https://app.manychat.com';
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS ?? 420_000);
-const CONCURRENCY = Number(process.env.CONCURRENCY ?? 6); // Allow multiple simultaneous requests (2 browsers x 3 tabs)
+// Max time to spend finding composer or automation UI; after this we treat as success and exit (avoid 7min hang)
+const COMPOSER_SEARCH_TIMEOUT_MS = Number(process.env.COMPOSER_SEARCH_TIMEOUT_MS ?? 35_000);
+const COMPOSER_CANDIDATE_WAIT_MS = Number(process.env.COMPOSER_CANDIDATE_WAIT_MS ?? 6000);
+const AUTOMATION_SEARCH_TIMEOUT_MS = Number(process.env.AUTOMATION_SEARCH_TIMEOUT_MS ?? 45_000);
+
+const FOLLOWUP_LOG_WEBHOOK_URL = process.env.FOLLOWUP_LOG_WEBHOOK_URL !== undefined ? process.env.FOLLOWUP_LOG_WEBHOOK_URL : 'https://n8n.setty.ai/webhook/FUs-logs';
+
+// Single-context mode: one browser window, multiple tabs (recommended to avoid "suspicious activity" flagging)
+const USE_SINGLE_CONTEXT = process.env.USE_SINGLE_CONTEXT !== 'false';
+const SINGLE_CONTEXT_MAX_TABS = Number(process.env.SINGLE_CONTEXT_MAX_TABS ?? 4);
+const CONCURRENCY = Number(process.env.CONCURRENCY ?? (USE_SINGLE_CONTEXT ? SINGLE_CONTEXT_MAX_TABS : 6));
 const queue = new PQueue({ concurrency: CONCURRENCY, timeout: JOB_TIMEOUT_MS });
-const DEFAULT_TYPING_BASE = Number(process.env.TYPING_BASE_MS ?? 60);  // Aggressive: faster typing
-const DEFAULT_TYPING_VARIANCE = Number(process.env.TYPING_VARIANCE_MS ?? 30);  // Aggressive: less variance
-const STAGGER_DELAY_MS = Number(process.env.STAGGER_DELAY_MS ?? 500); // Aggressive: minimal stagger
+queue.on('error', (err) => {
+  console.error('⚠️ PQueue job error (contained):', err.message);
+});
+
+// ---------- Deduplication (idempotency) ----------
+// Blocks identical retries from sending duplicate messages while still allowing
+// genuine recovery retries to run when the original attempt didn't actually send.
+const DEDUP_WINDOW_MS = Number(process.env.DEDUP_WINDOW_MS ?? 10 * 60 * 1000); // 10 min default
+// Map: dedupKey -> { promise, result?, completedAt? }
+//   - in-flight: { promise }
+//   - completed (and cached because actually sent): { promise, result, completedAt }
+const dedupMap = new Map();
+
+function buildDedupKey({ type, chatId, pageId, message, automation_name, idempotencyKey }) {
+  if (idempotencyKey) return `explicit:${idempotencyKey}`;
+  const payload = `${type}|${chatId}|${pageId}|${message ?? ''}|${automation_name ?? ''}`;
+  return 'auto:' + crypto.createHash('sha1').update(payload).digest('hex');
+}
+
+function dedupGet(key) {
+  const entry = dedupMap.get(key);
+  if (!entry) return null;
+  // Lazy TTL eviction for completed entries
+  if (entry.completedAt && Date.now() - entry.completedAt > DEDUP_WINDOW_MS) {
+    dedupMap.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function dedupSetInFlight(key, promise) {
+  dedupMap.set(key, { promise });
+}
+
+function dedupMarkSent(key, result) {
+  const existing = dedupMap.get(key);
+  const promise = existing?.promise ?? Promise.resolve(result);
+  dedupMap.set(key, { promise, result, completedAt: Date.now() });
+}
+
+function dedupClear(key) {
+  dedupMap.delete(key);
+}
+
+// ---------- Cookie sync (multi-VPS) ----------
+// In a multi-server deployment behind the router, one VPS is the "session master"
+// (the one where /init-login was run). Other VPSs periodically pull fresh cookies
+// from the master so they can serve any pageId without their own login flow.
+//
+// Set COOKIE_SYNC_MASTER_URL on workers (e.g. "http://session-master.internal:3000").
+// Leave it empty on the master itself, or on a single-VPS deployment.
+const COOKIE_SYNC_MASTER_URL = process.env.COOKIE_SYNC_MASTER_URL || '';
+const COOKIE_SYNC_INTERVAL_MS = Number(process.env.COOKIE_SYNC_INTERVAL_MS ?? 30 * 60 * 1000); // 30 min
+const COOKIE_SYNC_AUTH_TOKEN = process.env.COOKIE_SYNC_AUTH_TOKEN || process.env.AUTH_TOKEN || '';
+
+// Human-like timing to reduce automation detection (softer defaults than before)
+const DEFAULT_TYPING_BASE = Number(process.env.TYPING_BASE_MS ?? 100);
+const DEFAULT_TYPING_VARIANCE = Number(process.env.TYPING_VARIANCE_MS ?? 60);
+const STAGGER_DELAY_MS = Number(process.env.STAGGER_DELAY_MS ?? 2500);
 
 // Login cache to avoid checking every request
 let lastLoginCheck = 0;
 const LOGIN_CACHE_TTL = 5 * 60 * 1000; // Cache login status for 5 minutes
 let cachedLoginStatus = false;
 
-// Browser pool configuration
+// Browser pool configuration (used only when USE_SINGLE_CONTEXT=false)
 const BROWSER_POOL_SIZE = Number(process.env.BROWSER_POOL_SIZE ?? 2);
 const MAX_PAGES_PER_BROWSER = Number(process.env.MAX_PAGES_PER_BROWSER ?? 3);
 
@@ -101,14 +266,10 @@ async function ensureMasterContext() {
   return masterContext;
 }
 
-// Get cookies from master context
+// Get cookies from master context. No need to open a page — context already holds the cookies.
 async function getMasterCookies() {
   const ctx = await ensureMasterContext();
-  const page = await ctx.newPage();
-  await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
-  const cookies = await ctx.cookies();
-  await page.close();
-  return cookies;
+  return ctx.cookies();
 }
 
 // Create a new pool browser with cookies from master
@@ -191,6 +352,42 @@ async function syncCookiesToPool() {
     return true;
   } catch (e) {
     console.error('Error syncing cookies:', e.message);
+    return false;
+  }
+}
+
+// Pull cookies from the configured session master and apply them locally.
+// Used in multi-VPS deployments so worker VPSs stay logged in without running their own OAuth flow.
+async function syncCookiesFromMaster() {
+  if (!COOKIE_SYNC_MASTER_URL) return false;
+  try {
+    const url = `${COOKIE_SYNC_MASTER_URL.replace(/\/$/, '')}/get-session`;
+    console.log(`[cookie-sync] Fetching session from master: ${url}`);
+    const res = await fetch(url, {
+      headers: COOKIE_SYNC_AUTH_TOKEN ? { Authorization: `Bearer ${COOKIE_SYNC_AUTH_TOKEN}` } : {}
+    });
+    if (!res.ok) {
+      console.error(`[cookie-sync] Master returned ${res.status} ${res.statusText}`);
+      return false;
+    }
+    const data = await res.json();
+    const cookies = data?.sessionData?.cookies;
+    if (!Array.isArray(cookies) || cookies.length === 0) {
+      console.log('[cookie-sync] No cookies received from master');
+      return false;
+    }
+    const ctx = await ensureMasterContext();
+    await ctx.addCookies(cookies);
+    console.log(`[cookie-sync] Applied ${cookies.length} cookies from master`);
+    // Pool browsers (if any) get re-synced too
+    if (!USE_SINGLE_CONTEXT && poolInitialized) {
+      await syncCookiesToPool();
+    }
+    // Refresh login cache so the next /press doesn't immediately re-check
+    updateLoginCache(true);
+    return true;
+  } catch (e) {
+    console.error('[cookie-sync] Sync failed:', e.message);
     return false;
   }
 }
@@ -430,6 +627,110 @@ async function manualLoginFlow(page) {
   }
 }
 
+// Dismiss any pop-ups/modals (upgrade prompts, permission warnings, etc.)
+// Tries clicking X/close buttons first, falls back to Escape key.
+// Loops up to maxAttempts times to handle stacked modals.
+async function dismissPopups(page, maxAttempts = 3) {
+  console.log('Checking for pop-ups to dismiss...');
+  let totalDismissed = 0;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let dismissed = false;
+
+    // Strategy 1: Click known close-button patterns from ManyChat's UI
+    const closeButtonSelectors = [
+      'button[class*="_closeWithoutHeaderButtons"]',
+      'button[class*="_onlyIcon"][class*="_ghostLight"]',
+      'button[aria-label="Close"]',
+      'button[aria-label="close"]',
+      '[role="dialog"] button[class*="_onlyIcon"]',
+      '[class*="modal"] button[class*="_onlyIcon"]',
+    ];
+
+    for (const selector of closeButtonSelectors) {
+      try {
+        const btn = page.locator(selector).first();
+        if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+          console.log(`Found pop-up close button: ${selector}`);
+          // Click may trigger a navigation (e.g. ManyChat redirect). Race the click
+          // against a possible navigation so Playwright doesn't throw an unhandled timeout.
+          await Promise.all([
+            btn.click({ delay: 30, timeout: 2000 }).catch(() => {}),
+            page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
+          ]);
+          await page.waitForTimeout(600);
+          dismissed = true;
+          totalDismissed++;
+          console.log(`✅ Dismissed pop-up via close button (${selector})`);
+          break;
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+
+    // Strategy 2: If no close button found, check for modal content and press Escape
+    if (!dismissed) {
+      const modalIndicators = [
+        '[role="dialog"]',
+        'text="Get Advanced"',
+        'text="Get Business"',
+        'text="outgrown Pro"',
+        'text="outgrown"',
+        'text="campaigns are everywhere"',
+        'text="Your team is maxed"',
+        'text="Channel permissions lost"',
+        'text="Instagram channel lost connection"',
+        'text="Connection lost"',
+        'text="grant channel permissions"',
+        'text="Refresh Permissions"',
+        'text="Everything just hit pause"',
+      ];
+
+      let hasModal = false;
+      for (const indicator of modalIndicators) {
+        try {
+          if (await page.locator(indicator).first().isVisible({ timeout: 300 }).catch(() => false)) {
+            hasModal = true;
+            console.log(`Pop-up detected via indicator: ${indicator}`);
+            break;
+          }
+        } catch (_) {
+          continue;
+        }
+      }
+
+      if (hasModal) {
+        console.log('Pressing Escape to dismiss pop-up...');
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(600);
+        totalDismissed++;
+        dismissed = true;
+        console.log('✅ Dismissed pop-up via Escape key');
+      }
+    }
+
+    if (!dismissed) break;
+  }
+
+  if (totalDismissed > 0) {
+    console.log(`Dismissed ${totalDismissed} pop-up(s) total`);
+    await page.waitForTimeout(500);
+  } else {
+    console.log('No pop-ups detected');
+  }
+
+  return totalDismissed;
+}
+
+// Legacy aliases (kept for any external references)
+async function detectBlockingModal(page) {
+  return (await dismissPopups(page, 1)) > 0;
+}
+async function detectPermissionPopup(page) {
+  return detectBlockingModal(page);
+}
+
 async function openChat(page, chatId, pageId) {
   console.log(`Opening chat: ${chatId} on page: ${pageId}`);
   const url = `${BASE}/${pageId}/chat/${chatId}`;
@@ -440,10 +741,13 @@ async function openChat(page, chatId, pageId) {
     await safeWaitForLoad(page);
     console.log('Page loaded successfully');
 
-    // Aggressive: reduced wait for dynamic content
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(1500);
 
-    // Try common composer targets with more specific selectors
+    // Dismiss any pop-ups (upgrade prompts, permission warnings, etc.) then continue
+    await dismissPopups(page);
+
+    // Try common composer targets with a time budget so we don't hang for 7 minutes
+    const composerSearchStart = Date.now();
     const candidates = [
       // Most specific selectors first - avoid disabled buttons
       page.locator('[data-testid*="composer"]:not([disabled])'),
@@ -469,15 +773,19 @@ async function openChat(page, chatId, pageId) {
       page.locator('div[class*="input"] textarea:not([disabled])')
     ];
 
-    console.log('Looking for message composer...');
+    console.log(`Looking for message composer (max ${COMPOSER_SEARCH_TIMEOUT_MS / 1000}s total, ${COMPOSER_CANDIDATE_WAIT_MS}ms per candidate)...`);
     for (let i = 0; i < candidates.length; i++) {
+      if (Date.now() - composerSearchStart > COMPOSER_SEARCH_TIMEOUT_MS) {
+        console.log(`⏱️ Composer search time budget (${COMPOSER_SEARCH_TIMEOUT_MS}ms) exceeded — returning null to treat as success`);
+        return null;
+      }
       const candidate = candidates[i];
       try {
         const count = await candidate.count();
         console.log(`Trying selector ${i + 1}/${candidates.length}, found ${count} elements`);
         
         if (count > 0) {
-          await candidate.waitFor({ timeout: 10000 });
+          await candidate.waitFor({ timeout: COMPOSER_CANDIDATE_WAIT_MS });
           console.log(`Found message composer with selector ${i + 1}`);
           return candidate;
         }
@@ -487,23 +795,27 @@ async function openChat(page, chatId, pageId) {
       }
     }
     
-    // Take a screenshot for debugging
-    await page.screenshot({ path: './data/chat-page-error.png', fullPage: true });
+    // Composer not found within budget — return null so handlePress returns success (no 7min hang)
+    await page.screenshot({ path: './data/chat-page-error.png', fullPage: true }).catch(() => {});
     console.log('Screenshot saved to ./data/chat-page-error.png');
-    
-    throw new Error('Message composer not found. Check screenshot for debugging.');
+    console.log('⚠️ Message composer not found — returning null to treat as success and close job');
+    return null;
   } catch (error) {
     console.error('Error opening chat:', error);
     throw error;
   }
 }
 
-async function slowType(locator, text, baseDelay = DEFAULT_TYPING_BASE, variance = DEFAULT_TYPING_VARIANCE) {
+async function slowType(locator, text, state = {}, baseDelay = DEFAULT_TYPING_BASE, variance = DEFAULT_TYPING_VARIANCE) {
+  // `state` is a shared object the caller can inspect even if this function throws.
+  // After a `\n` is typed (= Enter pressed = ManyChat sends the message), state.enterPressed = true.
+  state.enterPressed = state.enterPressed ?? false;
   await locator.click({ delay: 20 }); // Aggressive: faster click
   for (const char of text) {
     const jitter = (Math.random() - 0.5) * 2 * variance;
     const delay = Math.max(10, Math.round(baseDelay + jitter)); // Aggressive: min 10ms instead of 15ms
     await locator.type(char, { delay });
+    if (char === '\n') state.enterPressed = true;
   }
 }
 
@@ -564,7 +876,7 @@ async function clickSendToInstagram(page) {
         if (isVisible && isEnabled) {
           console.log(`Found and clicking send button with selector ${i + 1}`);
           await button.click({ delay: 50 });
-          return;
+          return true;
         } else {
           console.log(`Button found but not visible/enabled: visible=${isVisible}, enabled=${isEnabled}`);
         }
@@ -578,8 +890,37 @@ async function clickSendToInstagram(page) {
   // Take a screenshot for debugging
   await page.screenshot({ path: './data/send-button-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/send-button-error.png');
-  
-  throw new Error('Could not find "Send to Instagram" button. Check screenshot for debugging.');
+  // Don't throw - treat as success so caller won't retry and send duplicate message. UI may have changed.
+  console.log('⚠️  "Send to Instagram" button not found - UI may have changed. Treating as success to avoid duplicate sends.');
+  return false;
+}
+
+// Click "Show contact" icon to expand Contact UI (required before automation timer/resume in new ManyChat UI)
+async function clickShowContactButton(page) {
+  console.log('Looking for "Show contact" icon (chat-toggle-user-bar-btn)...');
+  const selectors = [
+    page.locator('[data-test-id="chat-toggle-user-bar-btn"]'),
+    page.locator('[data-title="Show contact"]'),
+    page.locator('div[data-test-id="chat-toggle-user-bar-btn"]'),
+    page.locator('div[data-title="Show contact"]')
+  ];
+  for (let i = 0; i < selectors.length; i++) {
+    try {
+      const el = selectors[i].first();
+      if (await el.isVisible({ timeout: 5000 }).catch(() => false)) {
+        console.log(`Found "Show contact" icon with selector ${i + 1}, clicking...`);
+        await el.click({ delay: 50 });
+        await page.waitForTimeout(1000);
+        console.log('✅ "Show contact" icon clicked, Contact UI expanded');
+        return true;
+      }
+    } catch (e) {
+      console.log(`Show contact selector ${i + 1} failed:`, e.message);
+      continue;
+    }
+  }
+  console.log('⚠️  "Show contact" icon not found (Contact UI may already be expanded)');
+  return false;
 }
 
 async function clickAutomationButton(page) {
@@ -633,11 +974,11 @@ async function clickAutomationButton(page) {
           await button.click({ delay: 30 }); // Aggressive: faster click
           
           // Wait for modal/dialog to appear
-          await page.waitForTimeout(800); // Aggressive: reduced from 2000ms
+          await page.waitForTimeout(1500);
           
           // Check if modal appeared by looking for search input
           const searchInput = page.locator('input[placeholder*="Search"], input[placeholder*="search"]').first();
-          const modalVisible = await searchInput.isVisible({ timeout: 2000 }).catch(() => false); // Aggressive: reduced timeout
+          const modalVisible = await searchInput.isVisible({ timeout: 4000 }).catch(() => false);
           
           if (modalVisible) {
             console.log('Automation picker modal appeared');
@@ -659,16 +1000,21 @@ async function clickAutomationButton(page) {
   // Take a screenshot for debugging
   await page.screenshot({ path: './data/automation-button-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/automation-button-error.png');
-  
-  throw new Error('Could not find "Automation" button. Check screenshot for debugging.');
+  console.log('⚠️  "Automation" button not found - UI may have changed. Treating as success to avoid duplicate sends.');
+  return false;
 }
 
-async function searchAndSelectAutomation(page, automationName) {
+async function searchAndSelectAutomation(page, automationName, options = {}) {
+  const startTime = options.startTime ?? Date.now();
   console.log(`Searching for automation: "${automationName}"...`);
   
   const MAX_RETRIES = 3;
   
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    if (Date.now() - startTime > AUTOMATION_SEARCH_TIMEOUT_MS) {
+      console.log(`⏱️ Automation search time budget (${AUTOMATION_SEARCH_TIMEOUT_MS}ms) exceeded — treating as success`);
+      return false;
+    }
     console.log(`Attempt ${attempt}/${MAX_RETRIES} to find automation "${automationName}"...`);
     
     // Wait for search input field in the automation picker modal
@@ -683,12 +1029,16 @@ async function searchAndSelectAutomation(page, automationName) {
     
     let searchInput = null;
     for (let i = 0; i < searchInputSelectors.length; i++) {
+      if (Date.now() - startTime > AUTOMATION_SEARCH_TIMEOUT_MS) {
+        console.log(`⏱️ Automation search budget exceeded inside searchInput scan — bailing.`);
+        return false;
+      }
       const selector = searchInputSelectors[i];
       try {
         const count = await selector.count();
         if (count > 0) {
           const input = selector.first();
-          const isVisible = await input.isVisible({ timeout: 5000 }).catch(() => false);
+          const isVisible = await input.isVisible({ timeout: 1500 }).catch(() => false);
           if (isVisible) {
             searchInput = input;
             console.log(`Found search input with selector ${i + 1}`);
@@ -703,17 +1053,18 @@ async function searchAndSelectAutomation(page, automationName) {
     if (!searchInput) {
       if (attempt < MAX_RETRIES) {
         console.log('Could not find search input, retrying...');
-        await page.waitForTimeout(500 * attempt);
+        await page.waitForTimeout(800 * attempt);
         continue;
       }
-      throw new Error('Could not find search input in automation picker modal');
+      console.log('⚠️  Search input not found - UI may have changed. Treating as success to avoid duplicate sends.');
+      return false;
     }
     
     // Click on search input to ensure focus (short timeout - if it fails, continue anyway)
     try {
       console.log('Clicking on search input to ensure focus...');
       await searchInput.click({ timeout: 2000 });
-      await page.waitForTimeout(100);
+      await page.waitForTimeout(200);
     } catch (e) {
       console.log('Click on search input timed out, continuing anyway...');
     }
@@ -723,7 +1074,7 @@ async function searchAndSelectAutomation(page, automationName) {
       console.log('Clearing search field...');
       await page.keyboard.press('ControlOrMeta+a');
       await page.keyboard.press('Backspace');
-      await page.waitForTimeout(150);
+      await page.waitForTimeout(300);
     } catch (e) {
       console.log('Could not clear search input:', e.message);
     }
@@ -739,9 +1090,8 @@ async function searchAndSelectAutomation(page, automationName) {
     
     console.log('Automation name typed');
     
-    // IMPROVEMENT #4: Increased wait time for search results to appear
     console.log('Waiting for search results to load...');
-    await page.waitForTimeout(1200); // Increased from 600ms to 1200ms
+    await page.waitForTimeout(2000);
     
     // Find and click the automation card/row matching the exact name
     console.log('Looking for automation in search results...');
@@ -767,14 +1117,18 @@ async function searchAndSelectAutomation(page, automationName) {
     
     let automationFound = false;
     for (let i = 0; i < automationSelectors.length; i++) {
+      if (Date.now() - startTime > AUTOMATION_SEARCH_TIMEOUT_MS) {
+        console.log(`⏱️ Automation search budget exceeded inside automation scan — bailing.`);
+        return false;
+      }
       const selector = automationSelectors[i];
       try {
         const count = await selector.count();
         console.log(`Trying automation selector ${i + 1}/${automationSelectors.length}, found ${count} elements`);
-        
+
         if (count > 0) {
           const element = selector.first();
-          const isVisible = await element.isVisible({ timeout: 3000 }).catch(() => false);
+          const isVisible = await element.isVisible({ timeout: 1500 }).catch(() => false);
           
           if (isVisible) {
             // Verify the card/container contains the automation name
@@ -787,7 +1141,7 @@ async function searchAndSelectAutomation(page, automationName) {
               
               // Try normal click first, fall back to force:true if intercepted
               try {
-                await element.click({ delay: 50, timeout: 3000 });
+                await element.click({ delay: 50, timeout: 5000 });
               } catch (clickError) {
                 if (clickError.message && clickError.message.includes('intercepts pointer events')) {
                   console.log('Click intercepted, using force:true...');
@@ -810,13 +1164,12 @@ async function searchAndSelectAutomation(page, automationName) {
     
     if (automationFound) {
       console.log(`Automation "${automationName}" selected successfully on attempt ${attempt}`);
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(800);
       return true;
     }
     
-    // IMPROVEMENT #7: Retry logic with exponential backoff
     if (attempt < MAX_RETRIES) {
-      const waitTime = 500 * attempt; // 500ms, 1000ms for subsequent retries
+      const waitTime = 800 * attempt;
       console.log(`Automation not found on attempt ${attempt}, waiting ${waitTime}ms before retry...`);
       await page.screenshot({ path: `./data/automation-not-found-attempt-${attempt}.png`, fullPage: true });
       console.log(`Screenshot saved to ./data/automation-not-found-attempt-${attempt}.png`);
@@ -827,7 +1180,8 @@ async function searchAndSelectAutomation(page, automationName) {
   // All retries exhausted
   await page.screenshot({ path: './data/automation-not-found-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/automation-not-found-error.png');
-  throw new Error(`Automation "${automationName}" not found in search results after ${MAX_RETRIES} attempts. Check screenshots for debugging.`);
+  console.log(`⚠️  Automation "${automationName}" not found - UI may have changed. Treating as success to avoid duplicate sends.`);
+  return false;
 }
 
 async function clickPickThisAutomationButton(page) {
@@ -875,14 +1229,14 @@ async function clickPickThisAutomationButton(page) {
         
         if (isVisible && isEnabled) {
           console.log(`Found and clicking "Pick This Automation" button with selector ${i + 1}`);
-          await button.click({ delay: 30 }); // Aggressive: faster click
+          await button.click({ delay: 30 });
           
           // Wait for modal to close/disappear
-          await page.waitForTimeout(600); // Aggressive: reduced from 2000ms
+          await page.waitForTimeout(1200);
           
           // Check if modal closed by verifying search input is no longer visible
           const searchInput = page.locator('input[placeholder*="Search"]').first();
-          const modalClosed = await searchInput.isVisible({ timeout: 500 }).catch(() => false); // Aggressive: reduced timeout
+          const modalClosed = await searchInput.isVisible({ timeout: 1500 }).catch(() => false);
           
           if (!modalClosed) {
             console.log('Modal closed');
@@ -904,8 +1258,8 @@ async function clickPickThisAutomationButton(page) {
   // Take a screenshot for debugging
   await page.screenshot({ path: './data/pick-automation-button-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/pick-automation-button-error.png');
-  
-  throw new Error('Could not find "Pick This Automation" button. Check screenshot for debugging.');
+  console.log('⚠️  "Pick This Automation" button not found - UI may have changed. Treating as success to avoid duplicate sends.');
+  return false;
 }
 
 async function clickAutomationTimerButton(page) {
@@ -944,7 +1298,16 @@ async function clickAutomationTimerButton(page) {
         if (isVisible && isEnabled) {
           const buttonText = await button.textContent().catch(() => 'unknown');
           console.log(`✅ Found automation timer button: "${buttonText}" with selector ${i + 1}`);
-          await button.click({ delay: 50 });
+          try {
+            await button.click({ delay: 50, timeout: 3000 });
+          } catch (clickErr) {
+            if (clickErr.message && clickErr.message.includes('intercepts pointer events')) {
+              console.log('Click intercepted by overlay — using force click...');
+              await button.click({ delay: 50, force: true });
+            } else {
+              throw clickErr;
+            }
+          }
           console.log('✅ Automation timer button clicked successfully');
           return true;
         }
@@ -963,7 +1326,7 @@ async function clickResumeAutomationsButton(page) {
   console.log('Looking for "Resume automations" button in dropdown...');
   
   // Wait for dropdown to render
-  await page.waitForTimeout(200); // Aggressive: reduced from 500ms
+  await page.waitForTimeout(500);
   
   // Multiple strategies to find "Resume automations" in the dropdown
   // Based on HTML: <ul class="menu m-0"><li class="flex"><span class="d-flex"><svg...>Resume automations</span></li></ul>
@@ -1023,6 +1386,26 @@ async function clickResumeAutomationsButton(page) {
   return false;
 }
 
+// Fire-and-forget: send follow-up outcome to log webhook (never blocks or throws)
+function sendFollowupLog(payload) {
+  if (!FOLLOWUP_LOG_WEBHOOK_URL) return;
+  const body = {
+    ...payload,
+    timestamp: new Date().toISOString()
+  };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  fetch(FOLLOWUP_LOG_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: controller.signal
+  }).then(() => clearTimeout(timeoutId)).catch((e) => {
+    clearTimeout(timeoutId);
+    console.log('Followup log webhook failed (non-fatal):', e.message);
+  });
+}
+
 async function handlePress({ type, chatId, message, automation_name, pageId }) {
   console.log(`Starting handlePress for type: ${type}, chatId: ${chatId}, pageId: ${pageId}`);
   
@@ -1049,23 +1432,30 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
     throw new Error(`Invalid type: "${type}". Must be either "text" or "automation".`);
   }
 
-  // Get a browser from the pool
-  let poolBrowser = await getPoolBrowser();
+  // Get a page: single-context = one window with tabs (master only); else use browser pool
+  let poolBrowser = null;
   let page;
-  
-  try {
-    poolBrowser.activePages++;
-    console.log(`Using pool browser ${poolBrowser.index + 1} (now ${poolBrowser.activePages} active pages)`);
-    page = await poolBrowser.context.newPage();
-  } catch (e) {
-    console.log(`Pool browser ${poolBrowser.index + 1} failed, attempting recovery...`);
-    poolBrowser.activePages--;
-    poolBrowser = await recoverPoolBrowser(poolBrowser);
-    if (!poolBrowser) {
-      throw new Error('All browsers in pool are unavailable');
+  if (USE_SINGLE_CONTEXT) {
+    const ctx = await ensureMasterContext();
+    page = await ctx.newPage();
+    const tabCount = ctx.pages().length;
+    console.log(`Using master context (tab ${tabCount} of up to ${SINGLE_CONTEXT_MAX_TABS} concurrent)`);
+  } else {
+    poolBrowser = await getPoolBrowser();
+    try {
+      poolBrowser.activePages++;
+      console.log(`Using pool browser ${poolBrowser.index + 1} (now ${poolBrowser.activePages} active pages)`);
+      page = await poolBrowser.context.newPage();
+    } catch (e) {
+      console.log(`Pool browser ${poolBrowser.index + 1} failed, attempting recovery...`);
+      poolBrowser.activePages--;
+      poolBrowser = await recoverPoolBrowser(poolBrowser);
+      if (!poolBrowser) {
+        throw new Error('All browsers in pool are unavailable');
+      }
+      poolBrowser.activePages++;
+      page = await poolBrowser.context.newPage();
     }
-    poolBrowser.activePages++;
-    page = await poolBrowser.context.newPage();
   }
 
   try {
@@ -1078,7 +1468,7 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
       // Navigate to ManyChat to check login status
       await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
       await safeWaitForLoad(page);
-      await page.waitForTimeout(800); // Aggressive: reduced from 2000ms
+      await page.waitForTimeout(1500);
       
       if (!(await isLoggedIn(page))) {
         if (HEADLESS === 'false') {
@@ -1103,6 +1493,14 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
 
     console.log('Opening chat...');
     const composer = await openChat(page, chatId, pageId);
+
+    if (composer === null) {
+      console.log('⚠️ Composer not found after dismissing pop-ups — returning early (not sent, retries allowed)');
+      const result = { ok: true, sent: false, chatId, partialSuccess: true, message: 'Message composer not found (pop-ups were dismissed). Check ManyChat UI.' };
+      sendFollowupLog({ type, chatId, pageId, automation_name: type === 'automation' ? automation_name : undefined, ...result });
+      return result;
+    }
+
     console.log('Chat opened successfully');
 
     // Branch based on type
@@ -1121,82 +1519,144 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
       }
 
       console.log('Typing message...');
-      await slowType(composer, message);
-      console.log('Message typed successfully');
+      // typingState is shared with slowType so we can see if Enter was pressed (via \n) even if slowType throws
+      const typingState = { enterPressed: false };
+      try {
+        await slowType(composer, message, typingState);
+        console.log('Message typed successfully');
+      } catch (typingError) {
+        if (typingState.enterPressed) {
+          // Enter was pressed via \n before the throw — message was sent (at least the part before \n)
+          console.log(`⚠️  Typing failed mid-way but Enter was already pressed via \\n — treating as sent: ${typingError.message}`);
+          const result = { ok: true, sent: true, chatId, partialSuccess: true, message: `Typing failed mid-way but message was sent via Enter (\\n): ${typingError.message}` };
+          sendFollowupLog({ type, chatId, pageId, automation_name: undefined, ...result });
+          return result;
+        }
+        // No Enter pressed — message wasn't sent, propagate as a real error
+        throw typingError;
+      }
 
       console.log('Clicking send button...');
-      await clickSendToInstagram(page);
+      const sendClicked = await clickSendToInstagram(page);
+      if (!sendClicked) {
+        if (typingState.enterPressed) {
+          // Send button not found, but Enter was already pressed during typing — message was sent
+          console.log('⚠️  Send button not found but Enter (\\n) already sent the message — treating as sent.');
+          const result = { ok: true, sent: true, chatId, partialSuccess: true, message: 'Message sent via Enter (\\n in message); send button click was not needed.' };
+          sendFollowupLog({ type, chatId, pageId, automation_name: undefined, ...result });
+          return result;
+        }
+        console.log('⚠️  Send button not found and no Enter pressed - not sent, retries allowed.');
+        const result = { ok: true, sent: false, chatId, partialSuccess: true, message: 'Send button not found - UI may have changed. No duplicate send.' };
+        sendFollowupLog({ type, chatId, pageId, automation_name: undefined, ...result });
+        return result;
+      }
       console.log('Send button clicked successfully');
 
-      await page.waitForTimeout(800); // Aggressive: reduced from 2000ms
+      await page.waitForTimeout(1200);
       console.log('Message sent successfully');
       
-      // Step 1 - Click the automation timer button (with orange pause icon)
-      console.log('\n=== Starting automation button sequence ===');
-      console.log('Step 1: Looking for automation timer button...');
-      await page.waitForTimeout(600); // Aggressive: reduced from 2000ms
-      
-      const timerButtonClicked = await clickAutomationTimerButton(page);
-      if (timerButtonClicked) {
-        console.log('✅ Step 1 complete: Timer button clicked');
-        await page.waitForTimeout(1000); // Aggressive: reduced from 3000ms
+      // Post-send steps (Timer, Resume) - check if contact panel is expanded, expand if needed
+      try {
+        console.log('\n=== Starting automation button sequence ===');
+        await page.waitForTimeout(1000);
         
-        // Step 2 - Click "Resume automations" in the dropdown
-        console.log('Step 2: Looking for "Resume automations" in dropdown...');
-        const resumeButtonClicked = await clickResumeAutomationsButton(page);
-        if (resumeButtonClicked) {
-          console.log('✅ Step 2 complete: "Resume automations" clicked');
-          await page.waitForTimeout(500); // Aggressive: reduced from 2000ms
-          console.log('=== Automation button sequence complete ===\n');
+        // Check panel state: if "Show contact" button is visible, the panel is COLLAPSED
+        const showContactBtn = page.locator('[data-test-id="chat-toggle-user-bar-btn"][data-title="Show contact"]');
+        const panelCollapsed = await showContactBtn.isVisible({ timeout: 500 }).catch(() => false);
+        
+        if (panelCollapsed) {
+          console.log('Contact panel is collapsed — expanding...');
+          await clickShowContactButton(page);
+          await page.waitForTimeout(1000);
         } else {
-          console.log('⚠️  Step 2 failed: "Resume automations" button not found in dropdown');
+          console.log('Contact panel already expanded — proceeding directly');
         }
-      } else {
-        console.log('⚠️  Step 1 failed: Timer button not found (skipping Step 2)');
+        
+        const timerButtonClicked = await clickAutomationTimerButton(page);
+        
+        if (timerButtonClicked) {
+          console.log('✅ Step 1 complete: Timer button clicked');
+          await page.waitForTimeout(1500);
+          
+          console.log('Step 2: Looking for "Resume automations" in dropdown...');
+          const resumeButtonClicked = await clickResumeAutomationsButton(page);
+          if (resumeButtonClicked) {
+            console.log('✅ Step 2 complete: "Resume automations" clicked');
+            await page.waitForTimeout(800);
+            console.log('=== Automation button sequence complete ===\n');
+          } else {
+            console.log('⚠️  Step 2: "Resume automations" button not found - UI may have changed');
+          }
+        } else {
+          console.log('⚠️  Timer button not found even after expanding contact panel');
+        }
+      } catch (postSendError) {
+        console.error('Error in post-send steps (treating as success to avoid duplicate sends):', postSendError.message);
       }
       
-      return { ok: true, chatId, message: 'Message sent and automation sequence completed' };
-      
+      const result = { ok: true, sent: true, chatId, message: 'Message sent and automation sequence completed' };
+      sendFollowupLog({ type, chatId, pageId, automation_name: undefined, ...result });
+      return result;
+
     } else if (type === 'automation') {
       // AUTOMATION FOLLOWUP FLOW (new behavior)
       console.log('=== Starting automation followup flow ===');
-      
+      const automationStartTime = Date.now();
       try {
-        // Step 1: Click the Automation button
-        console.log('Step 1: Clicking Automation button...');
-        await clickAutomationButton(page);
+        const step1 = await clickAutomationButton(page);
+        if (!step1) {
+          console.log('⚠️  Automation button not found - not triggered, retries allowed.');
+          const result = { ok: true, sent: false, chatId, partialSuccess: true, message: 'Automation button not found - UI may have changed' };
+          sendFollowupLog({ type, chatId, pageId, automation_name, ...result });
+          return result;
+        }
         console.log('✅ Step 1 complete: Automation button clicked');
-        
-        // Step 2: Search and select automation by name
-        console.log('Step 2: Searching and selecting automation...');
-        await searchAndSelectAutomation(page, automation_name);
+
+        const step2 = await searchAndSelectAutomation(page, automation_name, { startTime: automationStartTime });
+        if (!step2) {
+          console.log('⚠️  Could not find/select automation - not triggered, retries allowed.');
+          const result = { ok: true, sent: false, chatId, partialSuccess: true, message: `Automation "${automation_name}" not found - UI may have changed` };
+          sendFollowupLog({ type, chatId, pageId, automation_name, ...result });
+          return result;
+        }
         console.log('✅ Step 2 complete: Automation selected');
-        
-        // Step 3: Click "Pick This Automation" button
-        console.log('Step 3: Clicking "Pick This Automation" button...');
-        await clickPickThisAutomationButton(page);
+
+        const step3 = await clickPickThisAutomationButton(page);
+        if (!step3) {
+          console.log('⚠️  Pick This Automation button not found - not triggered, retries allowed.');
+          const result = { ok: true, sent: false, chatId, partialSuccess: true, message: 'Pick This Automation button not found - UI may have changed' };
+          sendFollowupLog({ type, chatId, pageId, automation_name, ...result });
+          return result;
+        }
         console.log('✅ Step 3 complete: Automation picked successfully');
-        
+
         console.log('=== Automation followup flow complete ===');
-        return { ok: true, chatId, message: `Automation '${automation_name}' selected and triggered successfully` };
-        
+        const result = { ok: true, sent: true, chatId, message: `Automation '${automation_name}' selected and triggered successfully` };
+        sendFollowupLog({ type, chatId, pageId, automation_name, ...result });
+        return result;
       } catch (error) {
-        console.error('Error in automation followup flow:', error);
-        
-        // Take a screenshot for debugging
+        console.error('Unexpected error in automation flow:', error.message);
         try {
           await page.screenshot({ path: './data/automation-flow-error.png', fullPage: true });
           console.log('Error screenshot saved to ./data/automation-flow-error.png');
         } catch (e) {
-          console.log('Could not save error screenshot:', e.message);
+          // ignore
         }
-        
-        throw error;
+        // We can't be sure whether "Pick This Automation" was clicked before the throw.
+        // Conservative choice: mark as not-sent so retries are allowed. If the click did go through,
+        // n8n's retry will hit the same selectors but the automation has already been triggered;
+        // duplicate triggering is the cost of being correct in the more common case (failure before pick).
+        const result = { ok: true, sent: false, chatId, partialSuccess: true, message: `Unexpected error in automation flow: ${error.message}` };
+        sendFollowupLog({ type, chatId, pageId, automation_name, ...result });
+        return result;
       }
     }
     
   } catch (error) {
     console.error('Error in handlePress:', error);
+    
+    sendFollowupLog({ type, chatId, pageId, automation_name: type === 'automation' ? automation_name : undefined, ok: false, error: error.message });
     
     // Take a screenshot for debugging
     try {
@@ -1213,8 +1673,12 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
     } catch (e) {
       // Ignore close errors
     }
-    poolBrowser.activePages--;
-    console.log(`Page closed. Pool browser ${poolBrowser.index + 1} now has ${poolBrowser.activePages} active pages`);
+    if (!USE_SINGLE_CONTEXT && poolBrowser) {
+      poolBrowser.activePages--;
+      console.log(`Page closed. Pool browser ${poolBrowser.index + 1} now has ${poolBrowser.activePages} active pages`);
+    } else if (USE_SINGLE_CONTEXT) {
+      console.log('Tab closed (single-context mode)');
+    }
   }
 }
 
@@ -1224,9 +1688,12 @@ app.get('/', (_req, res) => res.json({
   status: 'running',
   version: '2.0.0',
   config: {
-    browserPoolSize: BROWSER_POOL_SIZE,
-    maxPagesPerBrowser: MAX_PAGES_PER_BROWSER,
-    concurrency: CONCURRENCY
+    singleContext: USE_SINGLE_CONTEXT,
+    singleContextMaxTabs: USE_SINGLE_CONTEXT ? SINGLE_CONTEXT_MAX_TABS : undefined,
+    browserPoolSize: USE_SINGLE_CONTEXT ? undefined : BROWSER_POOL_SIZE,
+    maxPagesPerBrowser: USE_SINGLE_CONTEXT ? undefined : MAX_PAGES_PER_BROWSER,
+    concurrency: CONCURRENCY,
+    dedupWindowMs: DEDUP_WINDOW_MS
   },
   endpoints: {
     health: '/healthz',
@@ -1234,9 +1701,58 @@ app.get('/', (_req, res) => res.json({
     confirm: '/confirm-login',
     send: '/press',
     syncPool: '/sync-pool',
-    reinitPool: '/reinit-pool'
+    reinitPool: '/reinit-pool',
+    dedupStatus: '/dedup-status'
   }
 }));
+
+// Inspect current dedup state (for debugging)
+app.get('/dedup-status', (_req, res) => {
+  const now = Date.now();
+  const entries = [];
+  for (const [key, entry] of dedupMap.entries()) {
+    entries.push({
+      key,
+      state: entry.completedAt ? 'cached' : 'in-flight',
+      ageMs: entry.completedAt ? now - entry.completedAt : undefined,
+      sent: entry.result?.sent ?? undefined
+    });
+  }
+  res.json({ ok: true, windowMs: DEDUP_WINDOW_MS, count: entries.length, entries });
+});
+
+// Manually trigger a crash-notification webhook for testing (bypasses rate limit).
+// Sends to the same FOLLOWUP_LOG_WEBHOOK_URL with event:'crash' so you can verify your
+// n8n alerting wiring without waiting for a real crash.
+app.post('/test-crash-notification', (req, res) => {
+  if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  if (!FOLLOWUP_LOG_WEBHOOK_URL) {
+    return res.status(400).json({ ok: false, error: 'FOLLOWUP_LOG_WEBHOOK_URL not configured (set it to receive crash notifications)' });
+  }
+  sendCrashNotification('test', new Error('Manual test of crash-notification webhook'), { force: true });
+  res.json({ ok: true, message: 'Test crash notification fired to FOLLOWUP_LOG_WEBHOOK_URL with event:"crash". Check your n8n workflow.' });
+});
+
+// Manually trigger a dedup-blocked notification for testing (bypasses rate limit).
+app.post('/test-dedup-notification', (req, res) => {
+  if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  if (!FOLLOWUP_LOG_WEBHOOK_URL) {
+    return res.status(400).json({ ok: false, error: 'FOLLOWUP_LOG_WEBHOOK_URL not configured' });
+  }
+  sendDedupNotification({
+    type: 'text',
+    chatId: 'TEST_CHAT_ID',
+    pageId: 'TEST_PAGE_ID',
+    message: 'Test dedup notification (manual trigger) — this is what a blocked duplicate looks like.',
+    dedupKind: 'cached',
+    ageMs: 30_000
+  }, { force: true });
+  res.json({ ok: true, message: 'Test dedup notification fired with event:"dedup-blocked". Check your n8n workflow.' });
+});
 
 app.get('/healthz', (_req, res) => {
   const poolStatus = browserPool.map(b => ({
@@ -1321,13 +1837,14 @@ app.post('/transfer-session', async (req, res) => {
       await page.close();
       console.log('Session transfer successful!');
       
-      // Sync to browser pool
-      if (!poolInitialized || browserPool.length === 0) {
-        await initBrowserPool();
+      // Sync to browser pool (only when not using single-context)
+      if (!USE_SINGLE_CONTEXT) {
+        if (!poolInitialized || browserPool.length === 0) {
+          await initBrowserPool();
+        }
+        await syncCookiesToPool();
       }
-      await syncCookiesToPool();
-      
-      return res.json({ ok: true, message: 'Session transferred successfully! Browser pool synced.' });
+      return res.json({ ok: true, message: USE_SINGLE_CONTEXT ? 'Session transferred successfully!' : 'Session transferred successfully! Browser pool synced.' });
     } else {
       await page.close();
       return res.status(400).json({ 
@@ -1346,9 +1863,9 @@ app.post('/debug-verify-login', async (req, res) => {
   try {
     console.log('Debug verify login requested');
     
-    await ensureContext();
-    const page = await context.newPage();
-    
+    const ctx = await ensureContext();
+    const page = await ctx.newPage();
+
     const debugResult = {
       timestamp: new Date().toISOString(),
       userDataDir: USER_DATA_DIR,
@@ -1436,8 +1953,8 @@ app.get('/debug-session', async (req, res) => {
       },
       criticalFiles: {},
       browserContext: {
-        initialized: !!context,
-        status: context ? 'active' : 'not created'
+        initialized: !!masterContext,
+        status: masterContext ? 'active' : 'not created'
       },
       environment: {
         NODE_ENV: process.env.NODE_ENV,
@@ -1599,20 +2116,25 @@ app.post('/upload-user-data', async (req, res) => {
   }
 });
 
-// Get session data endpoint (for local extraction)
-app.get('/get-session', async (_req, res) => {
+// Get session data endpoint (used by workers in multi-VPS deployments to pull cookies from the master)
+app.get('/get-session', async (req, res) => {
+  // Require auth: contains live session cookies — must not be public
+  if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
+    console.log('Unauthorized /get-session request');
+    return res.status(401).json({ error: 'unauthorized' });
+  }
   console.log('Session data requested');
-  
+
+  const ctx = await ensureContext();
+  // Cookies live on the context — no page needed.
+  const cookies = await ctx.cookies();
+
+  // localStorage/sessionStorage require a page; wrap in try/finally so the page is always closed
+  let page;
   try {
-    const ctx = await ensureContext();
-    const page = await ctx.newPage();
-    
+    page = await ctx.newPage();
     await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
-    
-    // Get cookies
-    const cookies = await page.context().cookies();
-    
-    // Get localStorage
+
     const localStorage = await page.evaluate(() => {
       const data = {};
       for (let i = 0; i < window.localStorage.length; i++) {
@@ -1621,8 +2143,7 @@ app.get('/get-session', async (_req, res) => {
       }
       return data;
     });
-    
-    // Get sessionStorage
+
     const sessionStorage = await page.evaluate(() => {
       const data = {};
       for (let i = 0; i < window.sessionStorage.length; i++) {
@@ -1631,20 +2152,20 @@ app.get('/get-session', async (_req, res) => {
       }
       return data;
     });
-    
-    await page.close();
-    
+
     res.json({
       ok: true,
-      sessionData: {
-        cookies,
-        localStorage,
-        sessionStorage
-      }
+      sessionData: { cookies, localStorage, sessionStorage }
     });
   } catch (e) {
     console.error('Error getting session data:', e);
-    res.status(500).json({ ok: false, error: e.message || String(e) });
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false, error: e.message || String(e) });
+    }
+  } finally {
+    if (page) {
+      await page.close().catch(() => {});
+    }
   }
 });
 
@@ -1668,14 +2189,15 @@ app.get('/confirm-login', async (_req, res) => {
       await page.close();
       console.log('Login confirmed successfully');
       
-      // Initialize/sync browser pool
-      if (!poolInitialized || browserPool.length === 0) {
-        console.log('Initializing browser pool...');
-        await initBrowserPool();
+      // Initialize/sync browser pool (only when not using single-context)
+      if (!USE_SINGLE_CONTEXT) {
+        if (!poolInitialized || browserPool.length === 0) {
+          console.log('Initializing browser pool...');
+          await initBrowserPool();
+        }
+        await syncCookiesToPool();
       }
-      await syncCookiesToPool();
-      
-      return res.json({ ok: true, message: 'Login confirmed! Browser pool synced.' });
+      return res.json({ ok: true, message: USE_SINGLE_CONTEXT ? 'Login confirmed!' : 'Login confirmed! Browser pool synced.' });
     } else {
       await page.close();
       console.log('Login confirmation failed - not logged in');
@@ -1725,13 +2247,12 @@ app.get('/init-login', async (_req, res) => {
     
     console.log('Login completed successfully');
     
-    // Sync cookies to browser pool
-    if (poolInitialized && browserPool.length > 0) {
+    // Sync cookies to browser pool (only when not using single-context)
+    if (!USE_SINGLE_CONTEXT && poolInitialized && browserPool.length > 0) {
       console.log('Syncing new login session to browser pool...');
       await syncCookiesToPool();
     }
-    
-    res.json({ ok: true, message: 'Login completed. Session saved to USER_DATA_DIR and synced to browser pool.' });
+    res.json({ ok: true, message: USE_SINGLE_CONTEXT ? 'Login completed. Session saved to USER_DATA_DIR.' : 'Login completed. Session saved to USER_DATA_DIR and synced to browser pool.' });
   } catch (e) {
     console.error('Error in init-login:', e);
     res.status(500).json({ ok: false, error: e.message || String(e) });
@@ -1775,9 +2296,71 @@ app.post('/press', async (req, res) => {
       }
     }
     
-    console.log('Adding task to queue...');
-    const result = await queue.add(() => handlePress({ type, chatId, message, automation_name, pageId }));
-    console.log('Task completed successfully:', result);
+    // ---------- Deduplication ----------
+    const idempotencyKey = req.headers['idempotency-key'] || req.headers['Idempotency-Key'];
+    const dedupKey = buildDedupKey({ type, chatId, pageId, message, automation_name, idempotencyKey });
+    const existing = dedupGet(dedupKey);
+
+    if (existing) {
+      if (existing.result) {
+        // Cached completed result (already actually sent within window) — block this duplicate
+        console.log(`🔁 Dedup HIT (cached) for key ${dedupKey} — returning cached result without running.`);
+        sendDedupNotification({
+          type, chatId, pageId, message, automation_name,
+          dedupKind: 'cached',
+          ageMs: existing.completedAt ? Date.now() - existing.completedAt : null
+        });
+        return res.json({ ...existing.result, deduped: 'cached' });
+      }
+      // Otherwise an in-flight request is running — wait for it and return the same outcome
+      console.log(`⏳ Dedup HIT (in-flight) for key ${dedupKey} — awaiting original request's result.`);
+      sendDedupNotification({
+        type, chatId, pageId, message, automation_name,
+        dedupKind: 'in-flight'
+      });
+      try {
+        const sharedResult = await existing.promise;
+        return res.json({ ...sharedResult, deduped: 'in-flight' });
+      } catch (sharedErr) {
+        // The original request errored. Fall through and let this request run fresh
+        // — except we don't, because the dedup map should already be cleared on error.
+        // To be safe, propagate the same error so n8n's later retries see consistent behavior.
+        console.error('In-flight original failed; returning same error to duplicate:', sharedErr.message);
+        return res.status(500).json({ error: sharedErr.message || String(sharedErr), deduped: 'in-flight' });
+      }
+    }
+
+    console.log(`🆕 Dedup MISS for key ${dedupKey} — running new job.`);
+    const jobPromise = queue.add(async () => {
+      try {
+        return await handlePress({ type, chatId, message, automation_name, pageId });
+      } catch (innerErr) {
+        console.error('Error inside queued job (contained):', innerErr.message);
+        throw innerErr;
+      }
+    });
+    dedupSetInFlight(dedupKey, jobPromise);
+
+    let result;
+    try {
+      result = await jobPromise;
+    } catch (jobErr) {
+      // Job threw — do NOT cache, allow future retries to run fresh
+      dedupClear(dedupKey);
+      console.error('Error in /press endpoint:', jobErr);
+      return res.status(500).json({ error: jobErr.message || String(jobErr) });
+    }
+
+    // Cache only if the message/automation was actually delivered
+    if (result?.sent === true) {
+      dedupMarkSent(dedupKey, result);
+      console.log(`✅ Cached result for key ${dedupKey} (sent=true).`);
+    } else {
+      dedupClear(dedupKey);
+      console.log(`↪︎ Not caching result for key ${dedupKey} (sent!=true) — retries allowed.`);
+    }
+
+    console.log('Task completed:', result);
     res.json(result);
   } catch (err) {
     console.error('Error in /press endpoint:', err);
@@ -1785,15 +2368,25 @@ app.post('/press', async (req, res) => {
   }
 });
 
+// Manual trigger for cookie sync from master (also runs automatically on a timer)
+app.post('/sync-from-master', async (_req, res) => {
+  if (!COOKIE_SYNC_MASTER_URL) {
+    return res.json({ ok: false, message: 'COOKIE_SYNC_MASTER_URL not configured (this server is not a worker).' });
+  }
+  const ok = await syncCookiesFromMaster();
+  res.json({ ok, master: COOKIE_SYNC_MASTER_URL });
+});
+
 // Endpoint to manually sync cookies to pool
 app.post('/sync-pool', async (_req, res) => {
   try {
+    if (USE_SINGLE_CONTEXT) {
+      return res.json({ ok: true, message: 'Single-context mode: no browser pool to sync.' });
+    }
     console.log('Manual pool sync requested');
-    
     if (!poolInitialized || browserPool.length === 0) {
       await initBrowserPool();
     }
-    
     const success = await syncCookiesToPool();
     
     if (success) {
@@ -1810,8 +2403,10 @@ app.post('/sync-pool', async (_req, res) => {
 // Endpoint to reinitialize the browser pool
 app.post('/reinit-pool', async (_req, res) => {
   try {
+    if (USE_SINGLE_CONTEXT) {
+      return res.json({ ok: true, message: 'Single-context mode: browser pool is disabled.' });
+    }
     console.log('Pool reinitialization requested');
-    
     // Close existing pool browsers
     for (const poolBrowser of browserPool) {
       try {
@@ -1867,12 +2462,28 @@ async function checkInitialLoginStatus() {
 // Initialize browser pool on startup
 async function initializeOnStartup() {
   console.log(`Browser pool config: ${BROWSER_POOL_SIZE} browsers, ${MAX_PAGES_PER_BROWSER} pages each`);
-  
+
+  // If this is a worker VPS (not the session master), pull cookies before checking login
+  if (COOKIE_SYNC_MASTER_URL) {
+    console.log(`[cookie-sync] Worker mode: master=${COOKIE_SYNC_MASTER_URL}, interval=${COOKIE_SYNC_INTERVAL_MS}ms`);
+    await syncCookiesFromMaster();
+    setInterval(() => {
+      syncCookiesFromMaster().catch(e => console.error('[cookie-sync] Periodic sync failed:', e.message));
+    }, COOKIE_SYNC_INTERVAL_MS);
+  } else {
+    console.log('[cookie-sync] No COOKIE_SYNC_MASTER_URL set - running as session master / single-VPS.');
+  }
+
   // Check if logged in first
   const loggedIn = await checkInitialLoginStatus();
-  
-  if (loggedIn) {
-    // Initialize browser pool with session cookies
+
+  if (USE_SINGLE_CONTEXT) {
+    if (loggedIn) {
+      console.log('✅ Single-context mode: one window, up to ' + SINGLE_CONTEXT_MAX_TABS + ' concurrent tabs');
+    } else {
+      console.log('⏳ Single-context mode: login required on first request');
+    }
+  } else if (loggedIn) {
     console.log('Initializing browser pool...');
     await initBrowserPool();
     await syncCookiesToPool();
@@ -1883,7 +2494,7 @@ async function initializeOnStartup() {
 }
 
 app.listen(PORT, async () => {
-  console.log(`manychat-clicker listening on :${PORT} (headless=${HEADLESS}, concurrency=${CONCURRENCY})`);
+  console.log(`manychat-clicker listening on :${PORT} (headless=${HEADLESS}, concurrency=${CONCURRENCY}, singleContext=${USE_SINGLE_CONTEXT}${USE_SINGLE_CONTEXT ? ` maxTabs=${SINGLE_CONTEXT_MAX_TABS}` : ''})`);
   console.log(`Request stagger delay: 0-${STAGGER_DELAY_MS}ms`);
   
   // Skip initialization in non-headless mode

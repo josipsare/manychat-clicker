@@ -1,9 +1,11 @@
 # ManyChat Clicker - Production Startup Script
 # This script is optimized for 24/7 operation on Windows Server
+# Domain: manychat-followupsv2.setty.ai
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  ManyChat Clicker - Production Mode" -ForegroundColor Cyan
+Write-Host "  Domain: manychat-followupsv2.setty.ai" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -48,12 +50,24 @@ Start-Process powershell -ArgumentList @(
 Start-Sleep -Seconds 8
 Write-Host "            Server started (check minimized window)" -ForegroundColor Green
 
-# Start Cloudflare Tunnel
-Write-Host "[Step 4/4] Starting Cloudflare Tunnel..." -ForegroundColor Yellow
-Start-Process powershell -ArgumentList @(
-    "-NoExit",
-    "-Command", "cd '$workDir'; Write-Host ''; Write-Host '===== YOUR PUBLIC URL =====' -ForegroundColor Green; Write-Host ''; .\cloudflared.exe tunnel --url http://localhost:3000"
-)
+# Check if named tunnel is configured
+$configPath = "$env:USERPROFILE\.cloudflared\config.yml"
+if (Test-Path $configPath) {
+    # Use named tunnel with permanent domain
+    Write-Host "[Step 4/4] Starting Cloudflare Tunnel (named)..." -ForegroundColor Yellow
+    Start-Process powershell -ArgumentList @(
+        "-NoExit",
+        "-Command", "cd '$workDir'; Write-Host ''; Write-Host '===== PERMANENT URL =====' -ForegroundColor Green; Write-Host 'https://manychat-followupsv2.setty.ai' -ForegroundColor Cyan; Write-Host ''; .\cloudflared.exe tunnel run manychat-clicker"
+    )
+} else {
+    # Fall back to quick tunnel (random URL)
+    Write-Host "[Step 4/4] Starting Cloudflare Tunnel (quick)..." -ForegroundColor Yellow
+    Write-Host "            NOTE: Using random URL. Run setup-tunnel.ps1 for permanent domain." -ForegroundColor Yellow
+    Start-Process powershell -ArgumentList @(
+        "-NoExit",
+        "-Command", "cd '$workDir'; Write-Host ''; Write-Host '===== YOUR PUBLIC URL =====' -ForegroundColor Green; Write-Host ''; .\cloudflared.exe tunnel --url http://localhost:3000"
+    )
+}
 Start-Sleep -Seconds 10
 
 Write-Host ""
@@ -63,13 +77,11 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Status Check:" -ForegroundColor Cyan
 Write-Host "  [OK] ManyChat server (minimized)" -ForegroundColor White
-Write-Host "  [OK] Cloudflare tunnel (check for URL)" -ForegroundColor White
-Write-Host "  [OK] Browser context (running)" -ForegroundColor White
+Write-Host "  [OK] Cloudflare tunnel" -ForegroundColor White
+Write-Host "  [OK] Browser pool (2 browsers)" -ForegroundColor White
 Write-Host ""
-Write-Host "Next Steps:" -ForegroundColor Yellow
-Write-Host "  1. Check tunnel window for your public URL" -ForegroundColor White
-Write-Host "  2. Test the API from your application" -ForegroundColor White
-Write-Host "  3. Set up Task Scheduler for auto-restart" -ForegroundColor White
+Write-Host "Your API URL:" -ForegroundColor Yellow
+Write-Host "  https://manychat-followupsv2.setty.ai" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Maintenance:" -ForegroundColor Cyan
 Write-Host "  - You can disconnect RDP (services stay running)" -ForegroundColor White
