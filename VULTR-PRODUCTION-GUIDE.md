@@ -204,7 +204,7 @@ You should see version info like `cloudflared version 2024.x.x`
 
 2. Add this content:
    ```
-   AUTH_TOKEN=pablonicotinepouches
+   AUTH_TOKEN=YOUR_AUTH_TOKEN_HERE
    HEADLESS=false
    PORT=3000
    ```
@@ -275,7 +275,7 @@ Invoke-WebRequest -Uri "https://your-random-name.trycloudflare.com/press" `
   -Method POST `
   -Body $body `
   -ContentType "application/json" `
-  -Headers @{Authorization="Bearer pablonicotinepouches"}
+  -Headers @{Authorization="Bearer YOUR_AUTH_TOKEN_HERE"}
 ```
 
 **✅ If successful, you'll get a JSON response with `"ok": true`**

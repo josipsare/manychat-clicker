@@ -60,7 +60,7 @@ if ($tunnelUrl) {
     Write-Host '    -Method POST ``' -ForegroundColor Gray
     Write-Host '    -Body $body ``' -ForegroundColor Gray
     Write-Host '    -ContentType "application/json" ``' -ForegroundColor Gray
-    Write-Host '    -Headers @{Authorization="Bearer pablonicotinepouches"}' -ForegroundColor Gray
+    Write-Host '    -Headers @{Authorization="Bearer YOUR_AUTH_TOKEN_HERE"}' -ForegroundColor Gray
     Write-Host ""
     Write-Host "========================================"  -ForegroundColor Green
     Write-Host ""

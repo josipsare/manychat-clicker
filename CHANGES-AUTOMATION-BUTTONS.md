@@ -65,7 +65,7 @@ The current `/press` endpoint will now automatically perform all three actions:
 Example test:
 ```powershell
 $body = @{chatId="1054056495"; message="Test with automation buttons"} | ConvertTo-Json
-Invoke-WebRequest -Uri "http://localhost:3000/press" -Method POST -Body $body -ContentType "application/json" -Headers @{Authorization="Bearer pablonicotinepouches"}
+Invoke-WebRequest -Uri "http://localhost:3000/press" -Method POST -Body $body -ContentType "application/json" -Headers @{Authorization="Bearer YOUR_AUTH_TOKEN_HERE"}
 ```
 
 ## No Breaking Changes
@@ -105,7 +105,7 @@ Invoke-WebRequest -Uri "http://localhost:3000/press" `
   -Method POST `
   -Body $body `
   -ContentType "application/json" `
-  -Headers @{Authorization="Bearer pablonicotinepouches"}
+  -Headers @{Authorization="Bearer YOUR_AUTH_TOKEN_HERE"}
 ```
 
 ### Switching Accounts

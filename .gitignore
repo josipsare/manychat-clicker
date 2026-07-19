@@ -12,3 +12,7 @@ cloudflared.exe
 ngrok.exe
 tunnel-url.txt
 *.zip
+
+# Sensitive browser/session export artifacts
+user-data-backup.zip
+session-data.json

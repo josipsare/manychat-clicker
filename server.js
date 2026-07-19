@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import PQueue from 'p-queue';
 import { chromium } from 'playwright';
-import crypto from 'crypto';
+import { DedupStore, buildDedupKey, summarizeDedupEntries } from './lib/dedup-store.js';
 
 // ---------- Global crash guards + alert ----------
 // Prevent unhandled errors from killing the entire Node.js process. The whole server
@@ -109,6 +109,15 @@ const {
   AUTH_TOKEN,
   PORT = process.env.PORT || 3000
 } = process.env;
+
+function requireAuth(req, res, next) {
+  if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
+    console.log(`Unauthorized ${req.method} ${req.path} request`);
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  return next();
+}
+
 // HEADLESS is `let` because /switch-headless reassigns it at runtime.
 let HEADLESS = process.env.HEADLESS ?? 'true';
 
@@ -137,40 +146,36 @@ queue.on('error', (err) => {
 // Blocks identical retries from sending duplicate messages while still allowing
 // genuine recovery retries to run when the original attempt didn't actually send.
 const DEDUP_WINDOW_MS = Number(process.env.DEDUP_WINDOW_MS ?? 10 * 60 * 1000); // 10 min default
-// Map: dedupKey -> { promise, result?, completedAt? }
-//   - in-flight: { promise }
-//   - completed (and cached because actually sent): { promise, result, completedAt }
-const dedupMap = new Map();
-
-function buildDedupKey({ type, chatId, pageId, message, automation_name, idempotencyKey }) {
-  if (idempotencyKey) return `explicit:${idempotencyKey}`;
-  const payload = `${type}|${chatId}|${pageId}|${message ?? ''}|${automation_name ?? ''}`;
-  return 'auto:' + crypto.createHash('sha1').update(payload).digest('hex');
-}
+const DEDUP_CLEANUP_INTERVAL_MS = Number(process.env.DEDUP_CLEANUP_INTERVAL_MS ?? Math.min(60_000, DEDUP_WINDOW_MS));
+const DEDUP_STATUS_LIMIT = Number(process.env.DEDUP_STATUS_LIMIT ?? 100);
+const dedupStore = new DedupStore({ windowMs: DEDUP_WINDOW_MS });
 
 function dedupGet(key) {
-  const entry = dedupMap.get(key);
-  if (!entry) return null;
-  // Lazy TTL eviction for completed entries
-  if (entry.completedAt && Date.now() - entry.completedAt > DEDUP_WINDOW_MS) {
-    dedupMap.delete(key);
-    return null;
-  }
-  return entry;
+  return dedupStore.get(key);
 }
 
 function dedupSetInFlight(key, promise) {
-  dedupMap.set(key, { promise });
+  dedupStore.setInFlight(key, promise);
 }
 
 function dedupMarkSent(key, result) {
-  const existing = dedupMap.get(key);
-  const promise = existing?.promise ?? Promise.resolve(result);
-  dedupMap.set(key, { promise, result, completedAt: Date.now() });
+  dedupStore.markSent(key, result);
 }
 
 function dedupClear(key) {
-  dedupMap.delete(key);
+  dedupStore.clear(key);
+}
+
+function cleanupDedupStore() {
+  const removed = dedupStore.cleanup();
+  if (removed > 0) {
+    console.log(`[dedup] Cleaned ${removed} stale completed entr${removed === 1 ? 'y' : 'ies'}; remaining=${dedupStore.size}`);
+  }
+  return removed;
+}
+
+if (DEDUP_CLEANUP_INTERVAL_MS > 0) {
+  setInterval(cleanupDedupStore, DEDUP_CLEANUP_INTERVAL_MS).unref?.();
 }
 
 // ---------- Cookie sync (multi-VPS) ----------
@@ -229,12 +234,12 @@ function getBrowserArgs() {
     '--disable-web-security',
     '--disable-features=VizDisplayCompositor'
   ];
-  
+
   if (isCloudEnvironment && HEADLESS === 'false') {
     browserArgs.push('--virtual-time-budget=5000');
     console.log('Cloud environment detected - using virtual display mode');
   }
-  
+
   return browserArgs;
 }
 
@@ -275,16 +280,16 @@ async function getMasterCookies() {
 // Create a new pool browser with cookies from master
 async function createPoolBrowser(index) {
   console.log(`Creating pool browser ${index + 1}...`);
-  
+
   const browser = await chromium.launch({
     headless: HEADLESS === 'true',
     args: getBrowserArgs()
   });
-  
+
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 }
   });
-  
+
   // Get cookies from master and add to this context
   try {
     const cookies = await getMasterCookies();
@@ -295,7 +300,7 @@ async function createPoolBrowser(index) {
   } catch (e) {
     console.log(`Pool browser ${index + 1}: Could not copy cookies (master may not be logged in)`);
   }
-  
+
   return {
     browser,
     context,
@@ -311,9 +316,9 @@ async function initBrowserPool() {
     console.log('Browser pool already initialized');
     return;
   }
-  
+
   console.log(`Initializing browser pool with ${BROWSER_POOL_SIZE} browsers...`);
-  
+
   for (let i = 0; i < BROWSER_POOL_SIZE; i++) {
     try {
       const poolBrowser = await createPoolBrowser(i);
@@ -323,7 +328,7 @@ async function initBrowserPool() {
       console.error(`Failed to create pool browser ${i + 1}:`, e.message);
     }
   }
-  
+
   poolInitialized = true;
   console.log(`Browser pool initialized with ${browserPool.length} browsers`);
 }
@@ -331,14 +336,14 @@ async function initBrowserPool() {
 // Sync cookies from master to all pool browsers
 async function syncCookiesToPool() {
   console.log('Syncing cookies from master to browser pool...');
-  
+
   try {
     const cookies = await getMasterCookies();
     if (!cookies || cookies.length === 0) {
       console.log('No cookies to sync from master');
       return false;
     }
-    
+
     for (const poolBrowser of browserPool) {
       try {
         await poolBrowser.context.addCookies(cookies);
@@ -347,7 +352,7 @@ async function syncCookiesToPool() {
         console.log(`Failed to sync cookies to pool browser ${poolBrowser.index + 1}:`, e.message);
       }
     }
-    
+
     console.log('Cookie sync complete');
     return true;
   } catch (e) {
@@ -398,15 +403,15 @@ async function getPoolBrowser() {
   if (!poolInitialized || browserPool.length === 0) {
     await initBrowserPool();
   }
-  
+
   if (browserPool.length === 0) {
     throw new Error('No browsers available in pool');
   }
-  
+
   // Find browser with least active pages (load balancing)
   let bestBrowser = null;
   let minPages = Infinity;
-  
+
   for (const poolBrowser of browserPool) {
     if (poolBrowser.healthy && poolBrowser.activePages < MAX_PAGES_PER_BROWSER) {
       if (poolBrowser.activePages < minPages) {
@@ -415,7 +420,7 @@ async function getPoolBrowser() {
       }
     }
   }
-  
+
   // If all browsers are at capacity, use round-robin
   if (!bestBrowser) {
     currentBrowserIndex = (currentBrowserIndex + 1) % browserPool.length;
@@ -424,14 +429,14 @@ async function getPoolBrowser() {
   } else {
     console.log(`Selected pool browser ${bestBrowser.index + 1} (${bestBrowser.activePages} active pages)`);
   }
-  
+
   return bestBrowser;
 }
 
 // Recover a crashed pool browser
 async function recoverPoolBrowser(poolBrowser) {
   console.log(`Recovering pool browser ${poolBrowser.index + 1}...`);
-  
+
   try {
     // Close old browser if possible
     try {
@@ -439,16 +444,16 @@ async function recoverPoolBrowser(poolBrowser) {
     } catch (e) {
       // Ignore close errors
     }
-    
+
     // Create new browser
     const newPoolBrowser = await createPoolBrowser(poolBrowser.index);
-    
+
     // Replace in pool
     const idx = browserPool.findIndex(b => b.index === poolBrowser.index);
     if (idx !== -1) {
       browserPool[idx] = newPoolBrowser;
     }
-    
+
     console.log(`Pool browser ${poolBrowser.index + 1} recovered successfully`);
     return newPoolBrowser;
   } catch (e) {
@@ -484,45 +489,45 @@ function updateLoginCache(status) {
 async function isLoggedIn(page) {
   try {
     console.log('Checking login status...');
-    
+
     // First check: URL must be on ManyChat dashboard
     const currentUrl = page.url();
     console.log(`Current URL: ${currentUrl}`);
-    
+
     if (!currentUrl.includes('app.manychat.com')) {
       console.log('Not on ManyChat domain');
       return false;
     }
-    
+
     if (currentUrl.includes('/login') || currentUrl.includes('/auth') || currentUrl.includes('/signin')) {
       console.log('Still on login/auth/signin page');
       return false;
     }
-    
+
     // Second check: Look for specific dashboard elements from the screenshot
     const dashboardIndicators = [
       // The personalized greeting "Hello, [Username]!" - most reliable indicator
       'h1:has-text("Hello,")',
       'h2:has-text("Hello,")',
       'div:has-text("Hello,")',
-      
+
       // User-specific data that only appears when logged in
       'text="connected channel"',
       'text="contacts"',
       'text="See Insights"',
-      
+
       // Dashboard-specific sections
       'text="Start Here"',
       'text="Hit Your Growth Goals"',
       'text="Automated Activity"',
-      
+
       // Navigation elements specific to logged-in state
       'text="Home"',
       'text="Auto-DM links from comments"',
       'text="Generate leads with stories"',
       'text="Respond to all your DMs"'
     ];
-    
+
     console.log('Checking for dashboard-specific elements...');
     for (const selector of dashboardIndicators) {
       try {
@@ -535,7 +540,7 @@ async function isLoggedIn(page) {
         // Continue to next selector
       }
     }
-    
+
     // Third check: Look for the left navigation sidebar with specific elements
     const sidebarIndicators = [
       // ManyChat logo
@@ -550,7 +555,7 @@ async function isLoggedIn(page) {
       // Home section
       'text="Home"'
     ];
-    
+
     console.log('Checking for sidebar elements...');
     for (const selector of sidebarIndicators) {
       try {
@@ -563,7 +568,7 @@ async function isLoggedIn(page) {
         // Continue to next selector
       }
     }
-    
+
     // Save a screenshot for debugging
     try {
       await page.screenshot({ path: './data/last-error.png', fullPage: true });
@@ -571,7 +576,7 @@ async function isLoggedIn(page) {
     } catch (e) {
       console.log('Could not save screenshot:', e.message);
     }
-    
+
     console.log('No specific dashboard indicators found - not logged in');
     return false;
   } catch (error) {
@@ -582,32 +587,32 @@ async function isLoggedIn(page) {
 
 async function manualLoginFlow(page) {
   console.log('Starting manual login flow...');
-  
+
   try {
     // Navigate to ManyChat login page
     await page.goto('https://manychat.com/login', { waitUntil: 'domcontentloaded' });
     console.log('Navigated to login page');
-    
+
     // Wait for page to fully load
     await safeWaitForLoad(page);
-    
+
     console.log('==========================================');
     console.log('MANUAL LOGIN INSTRUCTIONS:');
     console.log('1. Complete the ManyChat login in the browser window');
     console.log('2. Wait until you see the dashboard with "Hello, [YourName]!"');
     console.log('3. Press ENTER in this terminal when you are fully logged in');
     console.log('==========================================');
-    
+
     // Wait for user to complete login, poll for dashboard indicators
     console.log('Waiting for user to complete login...');
     for (let i = 0; i < 120; i++) { // Increased timeout to 4 minutes
       console.log(`Login check attempt ${i + 1}/120 (Press ENTER when logged in)`);
-      
+
       if (await isLoggedIn(page)) {
         console.log('Login detected automatically!');
         return true;
       }
-      
+
       // Check if we're still on login page
       const currentUrl = page.url();
       if (currentUrl.includes('/login') || currentUrl.includes('/auth') || currentUrl.includes('/signin')) {
@@ -615,10 +620,10 @@ async function manualLoginFlow(page) {
       } else {
         console.log('Moved away from login page, checking if logged in...');
       }
-      
+
       await page.waitForTimeout(2000);
     }
-    
+
     console.log('Login timeout - user did not complete login in time');
     return false;
   } catch (error) {
@@ -735,7 +740,7 @@ async function openChat(page, chatId, pageId) {
   console.log(`Opening chat: ${chatId} on page: ${pageId}`);
   const url = `${BASE}/${pageId}/chat/${chatId}`;
   console.log(`Navigating to: ${url}`);
-  
+
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await safeWaitForLoad(page);
@@ -783,7 +788,7 @@ async function openChat(page, chatId, pageId) {
       try {
         const count = await candidate.count();
         console.log(`Trying selector ${i + 1}/${candidates.length}, found ${count} elements`);
-        
+
         if (count > 0) {
           await candidate.waitFor({ timeout: COMPOSER_CANDIDATE_WAIT_MS });
           console.log(`Found message composer with selector ${i + 1}`);
@@ -794,7 +799,7 @@ async function openChat(page, chatId, pageId) {
         continue;
       }
     }
-    
+
     // Composer not found within budget — return null so handlePress returns success (no 7min hang)
     await page.screenshot({ path: './data/chat-page-error.png', fullPage: true }).catch(() => {});
     console.log('Screenshot saved to ./data/chat-page-error.png');
@@ -821,40 +826,40 @@ async function slowType(locator, text, state = {}, baseDelay = DEFAULT_TYPING_BA
 
 async function clickSendToInstagram(page) {
   console.log('Looking for "Send to Instagram" button...');
-  
+
   // Try multiple selectors for the send button
   const buttonSelectors = [
     // Role-based selectors
     page.getByRole('button', { name: /send to instagram/i }),
     page.getByRole('button', { name: /send/i }),
     page.getByRole('button', { name: /instagram/i }),
-    
+
     // Text-based selectors
     page.locator('button:has-text("Send to Instagram")'),
     page.locator('button:has-text("Send")'),
     page.locator('button:has-text("Instagram")'),
-    
+
     // Button with span containing text
     page.locator('button:has(span:text("Send to Instagram"))'),
     page.locator('button:has(span:text("Send"))'),
     page.locator('button:has(span:text("Instagram"))'),
-    
+
     // Data attribute selectors
     page.locator('[data-testid*="send"]'),
     page.locator('[data-testid*="instagram"]'),
     page.locator('[aria-label*="send"]'),
     page.locator('[aria-label*="instagram"]'),
-    
+
     // Class-based selectors
     page.locator('button[class*="send"]'),
     page.locator('button[class*="instagram"]'),
     page.locator('button[class*="primary"]'),
     page.locator('button[class*="_primary_"]'),
-    
+
     // Generic button selectors
     page.locator('button').filter({ hasText: /send/i }),
     page.locator('button').filter({ hasText: /instagram/i }),
-    
+
     // ManyChat specific selectors
     page.locator('div[class*="send-button"]'),
     page.locator('div[class*="action-button"]'),
@@ -866,13 +871,13 @@ async function clickSendToInstagram(page) {
     try {
       const count = await selector.count();
       console.log(`Trying send button selector ${i + 1}/${buttonSelectors.length}, found ${count} elements`);
-      
+
       if (count > 0) {
         // Check if button is visible and enabled
         const button = selector.first();
         const isVisible = await button.isVisible().catch(() => false);
         const isEnabled = await button.isEnabled().catch(() => false);
-        
+
         if (isVisible && isEnabled) {
           console.log(`Found and clicking send button with selector ${i + 1}`);
           await button.click({ delay: 50 });
@@ -886,7 +891,7 @@ async function clickSendToInstagram(page) {
       continue;
     }
   }
-  
+
   // Take a screenshot for debugging
   await page.screenshot({ path: './data/send-button-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/send-button-error.png');
@@ -925,33 +930,33 @@ async function clickShowContactButton(page) {
 
 async function clickAutomationButton(page) {
   console.log('Looking for "Automation" button...');
-  
+
   // Try multiple selectors for the Automation button
   const buttonSelectors = [
     // Button with data-title="Automation" attribute
     page.locator('button[data-title="Automation"]'),
     page.locator('button:has(svg[data-title="Automation"])'),
-    
+
     // Button containing SVG with data-title="Automation"
     page.locator('button:has(svg[data-title="Automation"])'),
-    
+
     // Class-based selectors
     page.locator('button[class*="automation"]'),
     page.locator('button[class*="flowPicker"]'),
     page.locator('button[class*="wrapperFlowPicker"]'),
-    
+
     // Button near "Reply" tab in message composer
     page.locator('button').filter({ hasText: /automation/i }),
-    
+
     // Data attribute selectors
     page.locator('[data-test-id*="automation"]'),
     page.locator('[data-test-id*="flow"]'),
     page.locator('[aria-label*="automation"]'),
     page.locator('[aria-label*="flow"]'),
-    
+
     // Generic button selectors
     page.locator('button').filter({ hasText: /automation/i }),
-    
+
     // ManyChat specific selectors
     page.locator('div[class*="automation-button"]'),
     page.locator('div[class*="flow-picker"]')
@@ -962,24 +967,24 @@ async function clickAutomationButton(page) {
     try {
       const count = await selector.count();
       console.log(`Trying automation button selector ${i + 1}/${buttonSelectors.length}, found ${count} elements`);
-      
+
       if (count > 0) {
         // Check if button is visible and enabled
         const button = selector.first();
         const isVisible = await button.isVisible().catch(() => false);
         const isEnabled = await button.isEnabled().catch(() => false);
-        
+
         if (isVisible && isEnabled) {
           console.log(`Found and clicking automation button with selector ${i + 1}`);
           await button.click({ delay: 30 }); // Aggressive: faster click
-          
+
           // Wait for modal/dialog to appear
           await page.waitForTimeout(1500);
-          
+
           // Check if modal appeared by looking for search input
           const searchInput = page.locator('input[placeholder*="Search"], input[placeholder*="search"]').first();
           const modalVisible = await searchInput.isVisible({ timeout: 4000 }).catch(() => false);
-          
+
           if (modalVisible) {
             console.log('Automation picker modal appeared');
             return true;
@@ -996,7 +1001,7 @@ async function clickAutomationButton(page) {
       continue;
     }
   }
-  
+
   // Take a screenshot for debugging
   await page.screenshot({ path: './data/automation-button-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/automation-button-error.png');
@@ -1007,16 +1012,16 @@ async function clickAutomationButton(page) {
 async function searchAndSelectAutomation(page, automationName, options = {}) {
   const startTime = options.startTime ?? Date.now();
   console.log(`Searching for automation: "${automationName}"...`);
-  
+
   const MAX_RETRIES = 3;
-  
+
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     if (Date.now() - startTime > AUTOMATION_SEARCH_TIMEOUT_MS) {
       console.log(`⏱️ Automation search time budget (${AUTOMATION_SEARCH_TIMEOUT_MS}ms) exceeded — treating as success`);
       return false;
     }
     console.log(`Attempt ${attempt}/${MAX_RETRIES} to find automation "${automationName}"...`);
-    
+
     // Wait for search input field in the automation picker modal
     const searchInputSelectors = [
       page.locator('input[placeholder*="Search"]'),
@@ -1026,7 +1031,7 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
       page.locator('input[class*="search"]'),
       page.locator('input').filter({ hasText: /search/i })
     ];
-    
+
     let searchInput = null;
     for (let i = 0; i < searchInputSelectors.length; i++) {
       if (Date.now() - startTime > AUTOMATION_SEARCH_TIMEOUT_MS) {
@@ -1049,7 +1054,7 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
         continue;
       }
     }
-    
+
     if (!searchInput) {
       if (attempt < MAX_RETRIES) {
         console.log('Could not find search input, retrying...');
@@ -1059,7 +1064,7 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
       console.log('⚠️  Search input not found - UI may have changed. Treating as success to avoid duplicate sends.');
       return false;
     }
-    
+
     // Click on search input to ensure focus (short timeout - if it fails, continue anyway)
     try {
       console.log('Clicking on search input to ensure focus...');
@@ -1068,7 +1073,7 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
     } catch (e) {
       console.log('Click on search input timed out, continuing anyway...');
     }
-    
+
     // Clear any existing text
     try {
       console.log('Clearing search field...');
@@ -1078,43 +1083,43 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
     } catch (e) {
       console.log('Could not clear search input:', e.message);
     }
-    
+
     // Type automation name
     console.log(`Typing automation name: "${automationName}"...`);
-    
+
     for (const char of automationName) {
       const jitter = (Math.random() - 0.5) * 2 * 20;
       const delay = Math.max(10, Math.round(40 + jitter));
       await page.keyboard.type(char, { delay });
     }
-    
+
     console.log('Automation name typed');
-    
+
     console.log('Waiting for search results to load...');
     await page.waitForTimeout(2000);
-    
+
     // Find and click the automation card/row matching the exact name
     console.log('Looking for automation in search results...');
-    
+
     // IMPROVED: Target clickable elements (buttons) first, then fall back to text elements
     const automationSelectors = [
       // Priority 1: Click the card's main action button that contains the automation name
       page.locator('[class*="card"]').filter({ hasText: automationName }).locator('button').first(),
       page.locator('[class*="card"]').filter({ hasText: automationName }).first(),
-      
+
       // Priority 2: Article-based cards
       page.locator('article').filter({ hasText: automationName }).locator('button').first(),
       page.locator('article').filter({ hasText: automationName }).first(),
-      
+
       // Priority 3: Direct text match (will use force:true if needed)
       page.locator(`text="${automationName}"`).first(),
       page.locator(`div:has-text("${automationName}")`).filter({ hasText: automationName }),
-      
+
       // Priority 4: Table row with matching name
       page.locator('tr').filter({ hasText: automationName }),
       page.locator('div[class*="listView"]').locator(`text="${automationName}"`).first()
     ];
-    
+
     let automationFound = false;
     for (let i = 0; i < automationSelectors.length; i++) {
       if (Date.now() - startTime > AUTOMATION_SEARCH_TIMEOUT_MS) {
@@ -1129,16 +1134,16 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
         if (count > 0) {
           const element = selector.first();
           const isVisible = await element.isVisible({ timeout: 1500 }).catch(() => false);
-          
+
           if (isVisible) {
             // Verify the card/container contains the automation name
             const text = await element.textContent().catch(() => '');
             // For buttons inside cards, also check parent text
             const parentText = await element.locator('..').textContent().catch(() => text);
-            
+
             if (text.includes(automationName) || parentText.includes(automationName)) {
               console.log(`Found automation "${automationName}" with selector ${i + 1}`);
-              
+
               // Try normal click first, fall back to force:true if intercepted
               try {
                 await element.click({ delay: 50, timeout: 5000 });
@@ -1150,7 +1155,7 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
                   throw clickError;
                 }
               }
-              
+
               automationFound = true;
               break;
             }
@@ -1161,13 +1166,13 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
         continue;
       }
     }
-    
+
     if (automationFound) {
       console.log(`Automation "${automationName}" selected successfully on attempt ${attempt}`);
       await page.waitForTimeout(800);
       return true;
     }
-    
+
     if (attempt < MAX_RETRIES) {
       const waitTime = 800 * attempt;
       console.log(`Automation not found on attempt ${attempt}, waiting ${waitTime}ms before retry...`);
@@ -1176,7 +1181,7 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
       await page.waitForTimeout(waitTime);
     }
   }
-  
+
   // All retries exhausted
   await page.screenshot({ path: './data/automation-not-found-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/automation-not-found-error.png');
@@ -1186,30 +1191,30 @@ async function searchAndSelectAutomation(page, automationName, options = {}) {
 
 async function clickPickThisAutomationButton(page) {
   console.log('Looking for "Pick This Automation" button...');
-  
+
   // Try multiple selectors for the "Pick This Automation" button
   const buttonSelectors = [
     // Exact text match
     page.getByRole('button', { name: /pick this automation/i }),
     page.locator('button:has-text("Pick This Automation")'),
     page.locator('button:has-text("Pick This")'),
-    
+
     // Button with span containing text
     page.locator('button:has(span:text("Pick This Automation"))'),
     page.locator('button:has(span:text("Pick This"))'),
-    
+
     // Class-based selectors
     page.locator('button[class*="pick"]'),
     page.locator('button[class*="select"]'),
     page.locator('button[class*="primary"]').filter({ hasText: /pick|select/i }),
-    
+
     // Data attribute selectors
     page.locator('[data-test-id*="pick"]'),
     page.locator('[data-test-id*="select"]'),
     page.locator('[data-test-id="flow-picker-select-flow-button"]'),
     page.locator('[aria-label*="pick"]'),
     page.locator('[aria-label*="select"]'),
-    
+
     // Button in preview section (right side of modal)
     page.locator('div[class*="preview"]').locator('button').filter({ hasText: /pick|select/i }),
     page.locator('div[class*="phoneContainer"]').locator('button').filter({ hasText: /pick|select/i })
@@ -1220,30 +1225,30 @@ async function clickPickThisAutomationButton(page) {
     try {
       const count = await selector.count();
       console.log(`Trying "Pick This Automation" button selector ${i + 1}/${buttonSelectors.length}, found ${count} elements`);
-      
+
       if (count > 0) {
         // Check if button is visible and enabled
         const button = selector.first();
         const isVisible = await button.isVisible().catch(() => false);
         const isEnabled = await button.isEnabled().catch(() => false);
-        
+
         if (isVisible && isEnabled) {
           console.log(`Found and clicking "Pick This Automation" button with selector ${i + 1}`);
           await button.click({ delay: 30 });
-          
+
           // Wait for modal to close/disappear
           await page.waitForTimeout(1200);
-          
+
           // Check if modal closed by verifying search input is no longer visible
           const searchInput = page.locator('input[placeholder*="Search"]').first();
           const modalClosed = await searchInput.isVisible({ timeout: 1500 }).catch(() => false);
-          
+
           if (!modalClosed) {
             console.log('Modal closed');
           } else {
             console.log('Modal may still be open, continuing anyway...');
           }
-          
+
           return true;
         } else {
           console.log(`Button found but not visible/enabled: visible=${isVisible}, enabled=${isEnabled}`);
@@ -1254,7 +1259,7 @@ async function clickPickThisAutomationButton(page) {
       continue;
     }
   }
-  
+
   // Take a screenshot for debugging
   await page.screenshot({ path: './data/pick-automation-button-error.png', fullPage: true });
   console.log('Screenshot saved to ./data/pick-automation-button-error.png');
@@ -1264,22 +1269,22 @@ async function clickPickThisAutomationButton(page) {
 
 async function clickAutomationTimerButton(page) {
   console.log('Looking for automation timer button (with orange pause icon)...');
-  
+
   // Multiple selectors for the countdown timer button at the top
   const buttonSelectors = [
     // Data attribute selector from the code you provided
     page.locator('button[data-onboarding-id="pause-automation-section"]'),
-    
+
     // Button containing time format (00:16:10, etc.)
     page.locator('button:has-text("00:")'),
     page.locator('button').filter({ hasText: /\d{2}:\d{2}:\d{2}/ }),
-    
+
     // Button with Automations header nearby
     page.locator('button').filter({ hasText: /^\d{2}:\d{2}/ }),
-    
+
     // Class-based selectors for the timer button
     page.locator('button[class*="btnV2"]').filter({ hasText: /\d{2}:/ }),
-    
+
     // Generic button near "Automations" text
     page.locator('text=Automations').locator('..').locator('button').first()
   ];
@@ -1289,12 +1294,12 @@ async function clickAutomationTimerButton(page) {
     try {
       const count = await selector.count();
       console.log(`Trying automation timer button selector ${i + 1}/${buttonSelectors.length}, found ${count} elements`);
-      
+
       if (count > 0) {
         const button = selector.first();
         const isVisible = await button.isVisible().catch(() => false);
         const isEnabled = await button.isEnabled().catch(() => false);
-        
+
         if (isVisible && isEnabled) {
           const buttonText = await button.textContent().catch(() => 'unknown');
           console.log(`✅ Found automation timer button: "${buttonText}" with selector ${i + 1}`);
@@ -1317,17 +1322,17 @@ async function clickAutomationTimerButton(page) {
       continue;
     }
   }
-  
+
   console.log('⚠️  Automation timer button not found (this may be normal if not visible)');
   return false;
 }
 
 async function clickResumeAutomationsButton(page) {
   console.log('Looking for "Resume automations" button in dropdown...');
-  
+
   // Wait for dropdown to render
   await page.waitForTimeout(500);
-  
+
   // Multiple strategies to find "Resume automations" in the dropdown
   // Based on HTML: <ul class="menu m-0"><li class="flex"><span class="d-flex"><svg...>Resume automations</span></li></ul>
   const buttonSelectors = [
@@ -1335,23 +1340,23 @@ async function clickResumeAutomationsButton(page) {
     page.locator('ul.menu li:first-child:has-text("Resume automations")'),
     page.locator('ul.menu li.flex:first-child:has-text("Resume automations")'),
     page.locator('ul[class*="menu"] li:first-child:has-text("Resume automations")'),
-    
+
     // Click the span inside the first li
     page.locator('ul.menu li:first-child span:has-text("Resume automations")'),
     page.locator('ul.menu li.flex:first-child span.d-flex:has-text("Resume automations")'),
-    
+
     // Generic first item in menu with Resume text
     page.locator('ul.menu li:first-child').filter({ hasText: /Resume automations/i }),
     page.locator('ul[class*="menu"] li:first-child').filter({ hasText: /Resume automations/i }),
-    
+
     // Exact match for "Resume automations" text in menu
     page.getByRole('button', { name: 'Resume automations' }),
     page.getByRole('button', { name: /resume automations/i }),
-    
+
     // Text-based selectors
     page.locator('li:has-text("Resume automations")').first(),
     page.locator('span:has-text("Resume automations")').first(),
-    
+
     // Menu item selectors
     page.locator('[role="menu"] li:first-child:has-text("Resume")'),
     page.locator('[role="menuitem"]:has-text("Resume automations")').first()
@@ -1362,12 +1367,12 @@ async function clickResumeAutomationsButton(page) {
     try {
       const count = await selector.count();
       console.log(`Trying "Resume automations" dropdown button selector ${i + 1}/${buttonSelectors.length}, found ${count} elements`);
-      
+
       if (count > 0) {
         const button = selector.first();
         const isVisible = await button.isVisible().catch(() => false);
         const isEnabled = await button.isEnabled().catch(() => false);
-        
+
         if (isVisible && isEnabled) {
           const buttonText = await button.textContent().catch(() => 'unknown');
           console.log(`✅ Found "Resume automations" button in dropdown: "${buttonText}" with selector ${i + 1}`);
@@ -1381,7 +1386,7 @@ async function clickResumeAutomationsButton(page) {
       continue;
     }
   }
-  
+
   console.log('⚠️  "Resume automations" button not found in dropdown (this may be normal if dropdown did not appear)');
   return false;
 }
@@ -1408,14 +1413,14 @@ function sendFollowupLog(payload) {
 
 async function handlePress({ type, chatId, message, automation_name, pageId }) {
   console.log(`Starting handlePress for type: ${type}, chatId: ${chatId}, pageId: ${pageId}`);
-  
+
   // Stagger requests with random delay to avoid overwhelming ManyChat
   if (STAGGER_DELAY_MS > 0) {
     const staggerDelay = Math.floor(Math.random() * STAGGER_DELAY_MS);
     console.log(`Staggering request by ${staggerDelay}ms...`);
     await new Promise(resolve => setTimeout(resolve, staggerDelay));
   }
-  
+
   // Validate type-specific fields
   if (type === 'text') {
     if (!chatId || !message || !pageId) {
@@ -1464,18 +1469,18 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
       console.log('Using cached login status (skipping full check)');
     } else {
       console.log('Checking login status...');
-      
+
       // Navigate to ManyChat to check login status
       await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
       await safeWaitForLoad(page);
       await page.waitForTimeout(1500);
-      
+
       if (!(await isLoggedIn(page))) {
         if (HEADLESS === 'false') {
           console.log('⏳ Not logged in - waiting for manual login in browser...');
           console.log('👉 Please complete the ManyChat login in the browser window');
           console.log('⏱️  Waiting up to 5 minutes for you to login...');
-          
+
           const loginSuccess = await manualLoginFlow(page);
           if (!loginSuccess) {
             throw new Error('Login timeout - please complete login and try again');
@@ -1507,12 +1512,12 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
     if (type === 'text') {
       // TEXT FOLLOWUP FLOW (existing behavior)
       console.log('=== Starting text followup flow ===');
-      
+
       // Optional: clear any prefilled text
-      try { 
+      try {
         console.log('Clearing any existing text...');
-        await composer.press('ControlOrMeta+a'); 
-        await composer.press('Backspace'); 
+        await composer.press('ControlOrMeta+a');
+        await composer.press('Backspace');
         console.log('Text cleared');
       } catch (e) {
         console.log('No text to clear or clear failed:', e.message);
@@ -1555,16 +1560,16 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
 
       await page.waitForTimeout(1200);
       console.log('Message sent successfully');
-      
+
       // Post-send steps (Timer, Resume) - check if contact panel is expanded, expand if needed
       try {
         console.log('\n=== Starting automation button sequence ===');
         await page.waitForTimeout(1000);
-        
+
         // Check panel state: if "Show contact" button is visible, the panel is COLLAPSED
         const showContactBtn = page.locator('[data-test-id="chat-toggle-user-bar-btn"][data-title="Show contact"]');
         const panelCollapsed = await showContactBtn.isVisible({ timeout: 500 }).catch(() => false);
-        
+
         if (panelCollapsed) {
           console.log('Contact panel is collapsed — expanding...');
           await clickShowContactButton(page);
@@ -1572,13 +1577,13 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
         } else {
           console.log('Contact panel already expanded — proceeding directly');
         }
-        
+
         const timerButtonClicked = await clickAutomationTimerButton(page);
-        
+
         if (timerButtonClicked) {
           console.log('✅ Step 1 complete: Timer button clicked');
           await page.waitForTimeout(1500);
-          
+
           console.log('Step 2: Looking for "Resume automations" in dropdown...');
           const resumeButtonClicked = await clickResumeAutomationsButton(page);
           if (resumeButtonClicked) {
@@ -1594,7 +1599,7 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
       } catch (postSendError) {
         console.error('Error in post-send steps (treating as success to avoid duplicate sends):', postSendError.message);
       }
-      
+
       const result = { ok: true, sent: true, chatId, message: 'Message sent and automation sequence completed' };
       sendFollowupLog({ type, chatId, pageId, automation_name: undefined, ...result });
       return result;
@@ -1652,12 +1657,12 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
         return result;
       }
     }
-    
+
   } catch (error) {
     console.error('Error in handlePress:', error);
-    
+
     sendFollowupLog({ type, chatId, pageId, automation_name: type === 'automation' ? automation_name : undefined, ok: false, error: error.message });
-    
+
     // Take a screenshot for debugging
     try {
       await page.screenshot({ path: './data/handle-press-error.png', fullPage: true });
@@ -1665,7 +1670,7 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
     } catch (e) {
       console.log('Could not save error screenshot:', e.message);
     }
-    
+
     throw error;
   } finally {
     try {
@@ -1683,8 +1688,8 @@ async function handlePress({ type, chatId, message, automation_name, pageId }) {
 }
 
 // ---------- Routes ----------
-app.get('/', (_req, res) => res.json({ 
-  service: 'ManyChat Clicker', 
+app.get('/', requireAuth, (_req, res) => res.json({
+  service: 'ManyChat Clicker',
   status: 'running',
   version: '2.0.0',
   config: {
@@ -1706,28 +1711,22 @@ app.get('/', (_req, res) => res.json({
   }
 }));
 
-// Inspect current dedup state (for debugging)
-app.get('/dedup-status', (_req, res) => {
-  const now = Date.now();
-  const entries = [];
-  for (const [key, entry] of dedupMap.entries()) {
-    entries.push({
-      key,
-      state: entry.completedAt ? 'cached' : 'in-flight',
-      ageMs: entry.completedAt ? now - entry.completedAt : undefined,
-      sent: entry.result?.sent ?? undefined
-    });
-  }
-  res.json({ ok: true, windowMs: DEDUP_WINDOW_MS, count: entries.length, entries });
+// Inspect current dedup state (for debugging). Requires auth because request
+// fingerprints are operational diagnostics; output is summarized and capped.
+app.get('/dedup-status', requireAuth, (req, res) => {
+  const requestedLimit = Number(req.query.limit ?? DEDUP_STATUS_LIMIT);
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.max(0, Math.min(requestedLimit, DEDUP_STATUS_LIMIT))
+    : DEDUP_STATUS_LIMIT;
+  const removedExpired = cleanupDedupStore();
+  const summary = summarizeDedupEntries(dedupStore, { limit, now: Date.now() });
+  res.json({ ...summary, limit, removedExpired });
 });
 
 // Manually trigger a crash-notification webhook for testing (bypasses rate limit).
 // Sends to the same FOLLOWUP_LOG_WEBHOOK_URL with event:'crash' so you can verify your
 // n8n alerting wiring without waiting for a real crash.
-app.post('/test-crash-notification', (req, res) => {
-  if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+app.post('/test-crash-notification', requireAuth, (req, res) => {
   if (!FOLLOWUP_LOG_WEBHOOK_URL) {
     return res.status(400).json({ ok: false, error: 'FOLLOWUP_LOG_WEBHOOK_URL not configured (set it to receive crash notifications)' });
   }
@@ -1736,10 +1735,7 @@ app.post('/test-crash-notification', (req, res) => {
 });
 
 // Manually trigger a dedup-blocked notification for testing (bypasses rate limit).
-app.post('/test-dedup-notification', (req, res) => {
-  if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+app.post('/test-dedup-notification', requireAuth, (req, res) => {
   if (!FOLLOWUP_LOG_WEBHOOK_URL) {
     return res.status(400).json({ ok: false, error: 'FOLLOWUP_LOG_WEBHOOK_URL not configured' });
   }
@@ -1760,8 +1756,8 @@ app.get('/healthz', (_req, res) => {
     activePages: b.activePages,
     healthy: b.healthy
   }));
-  
-  res.json({ 
+
+  res.json({
     ok: true,
     browserPool: {
       initialized: poolInitialized,
@@ -1772,43 +1768,43 @@ app.get('/healthz', (_req, res) => {
 });
 
 // Switch to headless mode endpoint
-app.get('/switch-headless', (_req, res) => {
+app.get('/switch-headless', requireAuth, (_req, res) => {
   if (HEADLESS === 'true') {
     return res.json({ ok: false, message: 'Already in headless mode' });
   }
-  
+
   // Update the HEADLESS variable
   process.env.HEADLESS = 'true';
   HEADLESS = 'true';
-  
+
   res.json({ ok: true, message: 'Switched to headless mode. Restart server to apply changes.' });
 });
 
 // Session transfer endpoint (for cloud deployment)
-app.post('/transfer-session', async (req, res) => {
+app.post('/transfer-session', requireAuth, async (req, res) => {
   console.log('Session transfer requested');
-  
+
   try {
     const { cookies, localStorage, sessionStorage } = req.body;
-    
+
     if (!cookies || !localStorage) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: 'Missing required session data (cookies, localStorage)' 
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing required session data (cookies, localStorage)'
       });
     }
-    
+
     const ctx = await ensureContext();
     const page = await ctx.newPage();
-    
+
     // Navigate to ManyChat
     await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
-    
+
     // Set cookies
     if (cookies && Array.isArray(cookies)) {
       await page.context().addCookies(cookies);
     }
-    
+
     // Set localStorage
     if (localStorage && typeof localStorage === 'object') {
       await page.evaluate((data) => {
@@ -1817,7 +1813,7 @@ app.post('/transfer-session', async (req, res) => {
         }
       }, localStorage);
     }
-    
+
     // Set sessionStorage
     if (sessionStorage && typeof sessionStorage === 'object') {
       await page.evaluate((data) => {
@@ -1826,17 +1822,17 @@ app.post('/transfer-session', async (req, res) => {
         }
       }, sessionStorage);
     }
-    
+
     // Refresh page to apply session data
     await page.reload({ waitUntil: 'domcontentloaded' });
     await safeWaitForLoad(page);
     await page.waitForTimeout(2000);
-    
+
     // Check if login worked
     if (await isLoggedIn(page)) {
       await page.close();
       console.log('Session transfer successful!');
-      
+
       // Sync to browser pool (only when not using single-context)
       if (!USE_SINGLE_CONTEXT) {
         if (!poolInitialized || browserPool.length === 0) {
@@ -1847,9 +1843,9 @@ app.post('/transfer-session', async (req, res) => {
       return res.json({ ok: true, message: USE_SINGLE_CONTEXT ? 'Session transferred successfully!' : 'Session transferred successfully! Browser pool synced.' });
     } else {
       await page.close();
-      return res.status(400).json({ 
-        ok: false, 
-        error: 'Session transfer failed - login not detected' 
+      return res.status(400).json({
+        ok: false,
+        error: 'Session transfer failed - login not detected'
       });
     }
   } catch (e) {
@@ -1859,10 +1855,10 @@ app.post('/transfer-session', async (req, res) => {
 });
 
 // Debug endpoint: Verify login detection with detailed results
-app.post('/debug-verify-login', async (req, res) => {
+app.post('/debug-verify-login', requireAuth, async (req, res) => {
   try {
     console.log('Debug verify login requested');
-    
+
     const ctx = await ensureContext();
     const page = await ctx.newPage();
 
@@ -1874,20 +1870,20 @@ app.post('/debug-verify-login', async (req, res) => {
       isLoggedIn: false,
       screenshot: null
     };
-    
+
     try {
       // Navigate to ManyChat
       console.log('Navigating to ManyChat...');
       await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(3000); // Wait for redirects
-      
+
       debugResult.url = page.url();
       console.log(`Current URL: ${debugResult.url}`);
-      
+
       // Run detailed checks
       debugResult.checks.onManyChatDomain = debugResult.url.includes('app.manychat.com');
       debugResult.checks.notOnLoginPage = !debugResult.url.includes('/login') && !debugResult.url.includes('/auth') && !debugResult.url.includes('/signin');
-      
+
       // Check for dashboard elements
       const selectorChecks = {
         'h1:has-text("Hello,")': false,
@@ -1897,7 +1893,7 @@ app.post('/debug-verify-login', async (req, res) => {
         'a[href*="/dashboard"]': false,
         '[data-testid*="dashboard"]': false
       };
-      
+
       for (const selector of Object.keys(selectorChecks)) {
         try {
           const element = await page.locator(selector).first();
@@ -1910,26 +1906,26 @@ app.post('/debug-verify-login', async (req, res) => {
           // Selector not found
         }
       }
-      
+
       debugResult.checks.selectors = selectorChecks;
       debugResult.checks.anyDashboardElement = Object.values(selectorChecks).some(v => v);
-      
+
       // Overall login status
-      debugResult.isLoggedIn = 
-        debugResult.checks.onManyChatDomain && 
-        debugResult.checks.notOnLoginPage && 
+      debugResult.isLoggedIn =
+        debugResult.checks.onManyChatDomain &&
+        debugResult.checks.notOnLoginPage &&
         debugResult.checks.anyDashboardElement;
-      
+
       // Take screenshot
       const screenshotBuffer = await page.screenshot({ fullPage: false });
       debugResult.screenshot = screenshotBuffer.toString('base64');
-      
+
       console.log(`Login check result: ${debugResult.isLoggedIn ? 'LOGGED IN' : 'NOT LOGGED IN'}`);
-      
+
     } finally {
       await page.close();
     }
-    
+
     res.json(debugResult);
   } catch (e) {
     console.error('Error in debug verify login:', e);
@@ -1938,11 +1934,11 @@ app.post('/debug-verify-login', async (req, res) => {
 });
 
 // Debug endpoint: Check session data on filesystem
-app.get('/debug-session', async (req, res) => {
+app.get('/debug-session', requireAuth, async (req, res) => {
   try {
     const fs = await import('fs');
     const path = await import('path');
-    
+
     const debugInfo = {
       userDataDir: USER_DATA_DIR,
       exists: fs.existsSync(USER_DATA_DIR),
@@ -1962,17 +1958,17 @@ app.get('/debug-session', async (req, res) => {
         HEADLESS: HEADLESS
       }
     };
-    
+
     if (debugInfo.exists) {
       try {
         const items = fs.readdirSync(USER_DATA_DIR);
         debugInfo.files = items.slice(0, 20); // First 20 items
         debugInfo.totalItems = items.length;
-        
+
         // Check Default folder
         const defaultPath = path.join(USER_DATA_DIR, 'Default');
         debugInfo.defaultFolder.exists = fs.existsSync(defaultPath);
-        
+
         if (debugInfo.defaultFolder.exists) {
           // Check critical session files
           const criticalFiles = {
@@ -1982,7 +1978,7 @@ app.get('/debug-session', async (req, res) => {
             'Sessions': path.join(defaultPath, 'Sessions'),
             'Network Persistent State': path.join(defaultPath, 'Network', 'Network Persistent State')
           };
-          
+
           Object.entries(criticalFiles).forEach(([name, filePath]) => {
             if (fs.existsSync(filePath)) {
               const stats = fs.statSync(filePath);
@@ -2000,7 +1996,7 @@ app.get('/debug-session', async (req, res) => {
         debugInfo.error = e.message;
       }
     }
-    
+
     res.json(debugInfo);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message || String(e) });
@@ -2008,35 +2004,35 @@ app.get('/debug-session', async (req, res) => {
 });
 
 // Upload user-data endpoint (for deployment)
-app.post('/upload-user-data', async (req, res) => {
+app.post('/upload-user-data', requireAuth, async (req, res) => {
   console.log('User data upload requested');
-  
+
   try {
     // This endpoint receives base64 encoded zip file
     const { fileData, fileName } = req.body;
-    
+
     if (!fileData) {
       return res.status(400).json({ ok: false, error: 'No file data provided' });
     }
-    
+
     const fs = await import('fs');
     const path = await import('path');
     const AdmZip = (await import('adm-zip')).default;
-    
+
     // Save the uploaded file
     const tempPath = '/tmp/user-data-upload.zip';
     const buffer = Buffer.from(fileData, 'base64');
     fs.writeFileSync(tempPath, buffer);
-    
+
     console.log(`User data file saved: ${tempPath} (${buffer.length} bytes)`);
-    
+
     // Smart extraction: Check if zip contains 'user-data/' folder
     const zip = new AdmZip(tempPath);
     const entries = zip.getEntries();
-    
+
     // Check if zip has 'user-data/' as root folder
     const hasUserDataFolder = entries.some(entry => entry.entryName.startsWith('user-data/'));
-    
+
     let extractPath;
     if (hasUserDataFolder) {
       // Zip contains 'user-data/' folder, extract to parent (/data)
@@ -2048,16 +2044,16 @@ app.post('/upload-user-data', async (req, res) => {
       extractPath = USER_DATA_DIR;
       console.log(`Zip contains files directly, extracting to: ${extractPath}`);
     }
-    
+
     // Create directory if it doesn't exist
     if (!fs.existsSync(extractPath)) {
       fs.mkdirSync(extractPath, { recursive: true });
     }
-    
+
     // Extract zip file
     console.log(`Extracting ${entries.length} entries...`);
     zip.extractAllTo(extractPath, true);
-    
+
     // Verify extraction
     if (fs.existsSync(USER_DATA_DIR)) {
       const files = fs.readdirSync(USER_DATA_DIR);
@@ -2071,12 +2067,12 @@ app.post('/upload-user-data', async (req, res) => {
         console.log(`Found in ${extractPath}: ${items.join(', ')}`);
       }
     }
-    
+
     console.log(`User data extracted to: ${extractPath}`);
-    
+
     // Clean up temp file
     fs.unlinkSync(tempPath);
-    
+
     // Close existing browser contexts to force reload of new session data
     if (masterContext) {
       try {
@@ -2089,7 +2085,7 @@ app.post('/upload-user-data', async (req, res) => {
         masterContext = null;
       }
     }
-    
+
     // Reinitialize browser pool with new session
     if (browserPool.length > 0) {
       console.log('Reinitializing browser pool with new session...');
@@ -2103,9 +2099,9 @@ app.post('/upload-user-data', async (req, res) => {
       browserPool.length = 0;
       poolInitialized = false;
     }
-    
-    res.json({ 
-      ok: true, 
+
+    res.json({
+      ok: true,
       message: 'User data uploaded and extracted successfully. Browser pool will reinitialize on next request.',
       extractedTo: extractPath,
       userDataDir: USER_DATA_DIR
@@ -2117,12 +2113,7 @@ app.post('/upload-user-data', async (req, res) => {
 });
 
 // Get session data endpoint (used by workers in multi-VPS deployments to pull cookies from the master)
-app.get('/get-session', async (req, res) => {
-  // Require auth: contains live session cookies — must not be public
-  if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
-    console.log('Unauthorized /get-session request');
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+app.get('/get-session', requireAuth, async (req, res) => {
   console.log('Session data requested');
 
   const ctx = await ensureContext();
@@ -2170,9 +2161,9 @@ app.get('/get-session', async (req, res) => {
 });
 
 // Manual login confirmation endpoint
-app.get('/confirm-login', async (_req, res) => {
+app.get('/confirm-login', requireAuth, async (_req, res) => {
   console.log('Manual login confirmation requested');
-  
+
   try {
     const ctx = await ensureMasterContext();
     const page = await ctx.newPage();
@@ -2181,14 +2172,14 @@ app.get('/confirm-login', async (_req, res) => {
     console.log('Navigating to ManyChat dashboard...');
     await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
     await safeWaitForLoad(page);
-    
+
     // Wait a bit for the page to fully load
     await page.waitForTimeout(3000);
 
     if (await isLoggedIn(page)) {
       await page.close();
       console.log('Login confirmed successfully');
-      
+
       // Initialize/sync browser pool (only when not using single-context)
       if (!USE_SINGLE_CONTEXT) {
         if (!poolInitialized || browserPool.length === 0) {
@@ -2201,9 +2192,9 @@ app.get('/confirm-login', async (_req, res) => {
     } else {
       await page.close();
       console.log('Login confirmation failed - not logged in');
-      return res.status(400).json({ 
-        ok: false, 
-        error: 'Not logged in. Please complete the login process first.' 
+      return res.status(400).json({
+        ok: false,
+        error: 'Not logged in. Please complete the login process first.'
       });
     }
   } catch (e) {
@@ -2213,9 +2204,9 @@ app.get('/confirm-login', async (_req, res) => {
 });
 
 // One-time manual OAuth bootstrap
-app.get('/init-login', async (_req, res) => {
+app.get('/init-login', requireAuth, async (_req, res) => {
   console.log(`Init-login called. USER_DATA_DIR: ${USER_DATA_DIR}`);
-  
+
   try {
     const ctx = await ensureContext();
     const page = await ctx.newPage();
@@ -2244,9 +2235,9 @@ app.get('/init-login', async (_req, res) => {
       console.log('Login failed or timed out');
       return res.status(500).json({ ok: false, error: 'Login not completed in time.' });
     }
-    
+
     console.log('Login completed successfully');
-    
+
     // Sync cookies to browser pool (only when not using single-context)
     if (!USE_SINGLE_CONTEXT && poolInitialized && browserPool.length > 0) {
       console.log('Syncing new login session to browser pool...');
@@ -2260,25 +2251,19 @@ app.get('/init-login', async (_req, res) => {
 });
 
 // Main action: type slowly and click "Send to Instagram" or trigger automation
-app.post('/press', async (req, res) => {
+app.post('/press', requireAuth, async (req, res) => {
   console.log('POST /press endpoint called');
-  
+
   try {
-    // Check authentication
-    if (!AUTH_TOKEN || req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
-      console.log('Unauthorized request - missing or invalid auth token');
-      return res.status(401).json({ error: 'unauthorized' });
-    }
-    
     const { type, chatId, message, automation_name, pageId } = req.body || {};
     console.log(`Request body: type=${type}, chatId=${chatId}, message=${message}, automation_name=${automation_name}, pageId=${pageId}`);
-    
+
     // Validate type field
     if (!type || (type !== 'text' && type !== 'automation')) {
       console.log('Invalid or missing type parameter');
       return res.status(400).json({ error: 'Field "type" is required and must be either "text" or "automation"' });
     }
-    
+
     // Validate type-specific fields
     if (type === 'text') {
       if (!chatId || !message || !pageId) {
@@ -2295,7 +2280,7 @@ app.post('/press', async (req, res) => {
         return res.status(400).json({ error: 'automation_name cannot be empty' });
       }
     }
-    
+
     // ---------- Deduplication ----------
     const idempotencyKey = req.headers['idempotency-key'] || req.headers['Idempotency-Key'];
     const dedupKey = buildDedupKey({ type, chatId, pageId, message, automation_name, idempotencyKey });
@@ -2369,7 +2354,7 @@ app.post('/press', async (req, res) => {
 });
 
 // Manual trigger for cookie sync from master (also runs automatically on a timer)
-app.post('/sync-from-master', async (_req, res) => {
+app.post('/sync-from-master', requireAuth, async (_req, res) => {
   if (!COOKIE_SYNC_MASTER_URL) {
     return res.json({ ok: false, message: 'COOKIE_SYNC_MASTER_URL not configured (this server is not a worker).' });
   }
@@ -2378,7 +2363,7 @@ app.post('/sync-from-master', async (_req, res) => {
 });
 
 // Endpoint to manually sync cookies to pool
-app.post('/sync-pool', async (_req, res) => {
+app.post('/sync-pool', requireAuth, async (_req, res) => {
   try {
     if (USE_SINGLE_CONTEXT) {
       return res.json({ ok: true, message: 'Single-context mode: no browser pool to sync.' });
@@ -2388,7 +2373,7 @@ app.post('/sync-pool', async (_req, res) => {
       await initBrowserPool();
     }
     const success = await syncCookiesToPool();
-    
+
     if (success) {
       res.json({ ok: true, message: `Cookies synced to ${browserPool.length} browsers` });
     } else {
@@ -2401,7 +2386,7 @@ app.post('/sync-pool', async (_req, res) => {
 });
 
 // Endpoint to reinitialize the browser pool
-app.post('/reinit-pool', async (_req, res) => {
+app.post('/reinit-pool', requireAuth, async (_req, res) => {
   try {
     if (USE_SINGLE_CONTEXT) {
       return res.json({ ok: true, message: 'Single-context mode: browser pool is disabled.' });
@@ -2417,14 +2402,14 @@ app.post('/reinit-pool', async (_req, res) => {
     }
     browserPool.length = 0;
     poolInitialized = false;
-    
+
     // Reinitialize
     await initBrowserPool();
     await syncCookiesToPool();
-    
-    res.json({ 
-      ok: true, 
-      message: `Browser pool reinitialized with ${browserPool.length} browsers` 
+
+    res.json({
+      ok: true,
+      message: `Browser pool reinitialized with ${browserPool.length} browsers`
     });
   } catch (e) {
     console.error('Error in reinit-pool:', e);
@@ -2438,14 +2423,14 @@ async function checkInitialLoginStatus() {
     console.log('Checking initial login status...');
     const ctx = await ensureMasterContext();
     const page = await ctx.newPage();
-    
+
     await page.goto('https://app.manychat.com', { waitUntil: 'domcontentloaded' });
     await safeWaitForLoad(page);
     await page.waitForTimeout(2000);
-    
+
     const isLoggedInStatus = await isLoggedIn(page);
     await page.close();
-    
+
     if (isLoggedInStatus) {
       console.log('✅ Login session found - ready to send messages!');
       return true;
@@ -2496,7 +2481,7 @@ async function initializeOnStartup() {
 app.listen(PORT, async () => {
   console.log(`manychat-clicker listening on :${PORT} (headless=${HEADLESS}, concurrency=${CONCURRENCY}, singleContext=${USE_SINGLE_CONTEXT}${USE_SINGLE_CONTEXT ? ` maxTabs=${SINGLE_CONTEXT_MAX_TABS}` : ''})`);
   console.log(`Request stagger delay: 0-${STAGGER_DELAY_MS}ms`);
-  
+
   // Skip initialization in non-headless mode
   if (HEADLESS === 'true') {
     await initializeOnStartup();
