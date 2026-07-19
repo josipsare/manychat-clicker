@@ -87,14 +87,14 @@ Invoke-WebRequest -Uri "http://localhost:3000/press" `
   -Method POST `
   -Body $body `
   -ContentType "application/json" `
-  -Headers @{Authorization="Bearer pablonicotinepouches"}
+  -Headers @{Authorization="Bearer YOUR_AUTH_TOKEN_HERE"}
 ```
 
 #### cURL
 ```bash
 curl -X POST http://localhost:3000/press \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer pablonicotinepouches" \
+  -H "Authorization: Bearer YOUR_AUTH_TOKEN_HERE" \
   -d '{
     "chatId": "1054056495",
     "message": "Test message",
@@ -108,7 +108,7 @@ const response = await fetch('http://localhost:3000/press', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
-    'Authorization': 'Bearer pablonicotinepouches'
+    'Authorization': 'Bearer YOUR_AUTH_TOKEN_HERE'
   },
   body: JSON.stringify({
     chatId: '1054056495',
@@ -141,7 +141,7 @@ Invoke-WebRequest -Uri "http://localhost:3000/press" `
   -Method POST `
   -Body $body `
   -ContentType "application/json" `
-  -Headers @{Authorization="Bearer pablonicotinepouches"}
+  -Headers @{Authorization="Bearer YOUR_AUTH_TOKEN_HERE"}
 ```
 
 ## Switching Accounts

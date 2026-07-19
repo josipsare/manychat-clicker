@@ -12,7 +12,7 @@ const body = {
   pageId: 'fb2860983'
 };
 const headers = {
-  'Authorization': 'Bearer pablonicotinepouches',
+  'Authorization': 'Bearer YOUR_AUTH_TOKEN_HERE',
   'Content-Type': 'application/json'
 };
 

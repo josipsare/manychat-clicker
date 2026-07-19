@@ -76,6 +76,6 @@ Write-Host ""
 Write-Host "Your deployment is ready to use. Test with:" -ForegroundColor Yellow
 Write-Host ""
 Write-Host '$body = @{chatId="1054056495"; message="Hello from Railway!"} | ConvertTo-Json' -ForegroundColor Cyan
-Write-Host 'Invoke-WebRequest -Uri "' + $railwayUrl + '/press" -Method POST -Body $body -ContentType "application/json" -Headers @{Authorization="Bearer pablonicotinepouches"}' -ForegroundColor Cyan
+Write-Host 'Invoke-WebRequest -Uri "' + $railwayUrl + '/press" -Method POST -Body $body -ContentType "application/json" -Headers @{Authorization="Bearer YOUR_AUTH_TOKEN_HERE"}' -ForegroundColor Cyan
 Write-Host ""
 
